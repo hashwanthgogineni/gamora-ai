@@ -1,0 +1,51 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Asset files (stored in Supabase Storage)
+core/assets/curated/**
+!core/assets/curated/metadata/
+!core/assets/curated/README.md
+!core/assets/curated/download_assets.py
+core/assets/curated/temp_downloads/
+
+# Godot executables and large files
+Godot/**/*.exe
+Godot/**/*.app
+Godot/**/*.dmg
+Godot/**/*.zip
+
+# Exported game builds (should not be in repo)
+**/exports/*.exe
+**/exports/*.app
+**/exports/*.pck
+**/exports/*.wasm
+
+# Godot cache and build files
+**/.godot/
+*.import
+
+# Large binary files (over 50MB)
+*.exe
+!node_modules/**/*.exe

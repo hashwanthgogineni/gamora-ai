@@ -1,0 +1,326 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Gamora AI Design System - WhatsApp Green Theme with Premium Minimalistic Design
+All colors MUST be HSL.
+*/
+
+@layer base {
+  :root {
+    /* Core Brand Colors - WhatsApp Green (#25D366) */
+    --gamora-green: 142 70% 49%;
+    --gamora-green-light: 142 70% 55%;
+    --gamora-green-dark: 142 70% 43%;
+    --gamora-green-glow: 142 70% 49%;
+    
+    /* Premium Backgrounds */
+    --background: 0 0% 100%;
+    --background-secondary: 0 0% 98%;
+    --background-tertiary: 0 0% 96%;
+    --foreground: 0 0% 9%;
+    --foreground-muted: 0 0% 45%;
+
+    /* Cards & Surfaces */
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 9%;
+    --card-border: 0 0% 90%;
+
+    /* Interactive Elements */
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 9%;
+
+    --primary: 142 70% 49%;
+    --primary-foreground: 0 0% 100%;
+    --primary-hover: 142 70% 55%;
+    --primary-active: 142 70% 43%;
+
+    --secondary: 0 0% 96%;
+    --secondary-foreground: 0 0% 9%;
+    --secondary-hover: 0 0% 94%;
+
+    /* Muted Elements */
+    --muted: 0 0% 96%;
+    --muted-foreground: 0 0% 45%;
+
+    /* Accent Colors */
+    --accent: 142 70% 49%;
+    --accent-foreground: 0 0% 100%;
+    --accent-light: 142 70% 97%;
+
+    /* Status Colors */
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --success: 142 70% 49%;
+    --success-foreground: 0 0% 100%;
+    --warning: 38 92% 50%;
+    --warning-foreground: 0 0% 100%;
+
+    /* Borders & Inputs */
+    --border: 0 0% 90%;
+    --border-light: 0 0% 95%;
+    --input: 0 0% 100%;
+    --input-border: 0 0% 90%;
+    --ring: 142 70% 49%;
+
+    /* Design System */
+    --radius: 0.75rem;
+    --radius-sm: 0.5rem;
+    --radius-lg: 1rem;
+    
+    /* Shadows */
+    --shadow-sm: 0 1px 2px 0 hsl(0 0% 0% / 0.05);
+    --shadow: 0 1px 3px 0 hsl(0 0% 0% / 0.1), 0 1px 2px -1px hsl(0 0% 0% / 0.1);
+    --shadow-md: 0 4px 6px -1px hsl(0 0% 0% / 0.1), 0 2px 4px -2px hsl(0 0% 0% / 0.1);
+    --shadow-lg: 0 10px 15px -3px hsl(0 0% 0% / 0.1), 0 4px 6px -4px hsl(0 0% 0% / 0.1);
+    --shadow-xl: 0 20px 25px -5px hsl(0 0% 0% / 0.1), 0 8px 10px -6px hsl(0 0% 0% / 0.1);
+    --shadow-glow: 0 0 20px hsl(142 70% 49% / 0.3);
+    
+    /* Gradients */
+    --gradient-primary: linear-gradient(135deg, hsl(142 70% 49%) 0%, hsl(142 70% 55%) 100%);
+    --gradient-surface: linear-gradient(180deg, hsl(0 0% 100%) 0%, hsl(0 0% 98%) 100%);
+    --gradient-glow: radial-gradient(circle at center, hsl(142 70% 49% / 0.15) 0%, transparent 70%);
+    
+    /* Animations */
+    --transition-fast: 150ms cubic-bezier(0.4, 0, 0.2, 1);
+    --transition-normal: 250ms cubic-bezier(0.4, 0, 0.2, 1);
+    --transition-slow: 350ms cubic-bezier(0.4, 0, 0.2, 1);
+    --transition-bounce: 500ms cubic-bezier(0.68, -0.55, 0.265, 1.55);
+
+    /* Sidebar */
+    --sidebar-background: 0 0% 98%;
+    --sidebar-foreground: 240 5.3% 26.1%;
+    --sidebar-primary: 240 5.9% 10%;
+    --sidebar-primary-foreground: 0 0% 98%;
+    --sidebar-accent: 240 4.8% 95.9%;
+    --sidebar-accent-foreground: 240 5.9% 10%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+  }
+
+  .dark {
+    /* Dark Theme Colors - TRUE BLACK with visible borders */
+    --background: 0 0% 0%;
+    --background-secondary: 0 0% 0%;
+    --background-tertiary: 0 0% 0%;
+    --foreground: 0 0% 95%;
+    --foreground-muted: 0 0% 65%;
+
+    /* Cards & Surfaces */
+    --card: 0 0% 0%;
+    --card-foreground: 0 0% 95%;
+    --card-border: 0 0% 40%; /* lighter border */
+
+    /* Interactive Elements */
+    --popover: 0 0% 0%;
+    --popover-foreground: 0 0% 95%;
+
+    --primary: 142 70% 49%;
+    --primary-foreground: 0 0% 100%;
+    --primary-hover: 142 70% 55%;
+    --primary-active: 142 70% 43%;
+
+    --secondary: 0 0% 5%;
+    --secondary-foreground: 0 0% 95%;
+    --secondary-hover: 0 0% 8%;
+
+    /* Muted Elements */
+    --muted: 0 0% 5%;
+    --muted-foreground: 0 0% 65%;
+
+    /* Accent Colors */
+    --accent: 142 70% 49%;
+    --accent-foreground: 0 0% 100%;
+    --accent-light: 142 70% 10%;
+
+    /* Status Colors */
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --success: 142 70% 49%;
+    --success-foreground: 0 0% 100%;
+    --warning: 38 92% 50%;
+    --warning-foreground: 0 0% 100%;
+
+    /* Borders & Inputs */
+    --border: 0 0% 40%; /* more visible */
+    --border-light: 0 0% 50%;
+    --input: 0 0% 0%;
+    --input-border: 0 0% 40%;
+    --ring: 142 70% 49%;
+
+    /* Shadows */
+    --shadow-glow: 0 0 20px hsl(142 70% 49% / 0.4);
+    
+    /* Gradients */
+    --gradient-primary: linear-gradient(135deg, hsl(142 70% 49%) 0%, hsl(142 70% 55%) 100%);
+    --gradient-surface: linear-gradient(180deg, hsl(0 0% 0%) 0%, hsl(0 0% 0%) 100%);
+    --gradient-glow: radial-gradient(circle at center, hsl(142 70% 49% / 0.2) 0%, transparent 70%);
+
+    /* Sidebar */
+    --sidebar-background: 0 0% 0%;
+    --sidebar-foreground: 0 0% 95%;
+    --sidebar-primary: 142 70% 49%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 0 0% 5%;
+    --sidebar-accent-foreground: 0 0% 95%;
+    --sidebar-border: 0 0% 40%;
+    --sidebar-ring: 142 70% 49%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  /* Global Thin & Minimalistic Scrollbar */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--muted-foreground) / 0.2) transparent;
+  }
+  
+  *::-webkit-scrollbar {
+    width: 3px;
+    height: 3px;
+  }
+  
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  
+  *::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.2);
+    border-radius: 3px;
+    transition: background 0.2s ease;
+  }
+  
+  *::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.35);
+  }
+
+  /* ✅ use system UI sans globally (matches your screenshot) */
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+  }
+  
+  .font-logo {
+    font-family: 'Pixelify Sans', cursive; /* only for Gamora logo */
+  }
+  
+  .font-mono {
+    font-family: monospace;
+  }
+}
+
+@layer components {
+  /* Make borders slightly thicker */
+  button,
+  .btn,
+  input,
+  textarea {
+    border-width: 1.5px;
+  }
+
+  /* Premium Glassmorphism Effects */
+  .glass {
+    @apply backdrop-blur-xl bg-white/80 border border-white/20;
+  }
+  
+  .glass-dark {
+    @apply backdrop-blur-xl bg-black/20 border border-white/10;
+  }
+  
+  /* Smooth Animations */
+  .animate-fade-in {
+    animation: fadeIn var(--transition-normal) ease-out;
+  }
+  
+  .animate-slide-up {
+    animation: slideUp var(--transition-normal) ease-out;
+  }
+  
+  .animate-scale-in {
+    animation: scaleIn var(--transition-bounce) ease-out;
+  }
+  
+  .animate-glow {
+    animation: glow 2s ease-in-out infinite alternate;
+  }
+  
+  /* Premium Hover Effects */
+  .hover-lift {
+    @apply transition-all duration-300 hover:scale-105 hover:shadow-lg;
+  }
+  
+  .hover-glow {
+    @apply transition-all duration-300 hover:shadow-[0_0_20px_hsl(var(--gamora-green-glow)/0.4)];
+  }
+  
+  /* Custom Scrollbar - Thin & Minimalistic */
+  .custom-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--muted-foreground) / 0.2) transparent;
+  }
+  
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 3px;
+    height: 3px;
+  }
+  
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.2);
+    border-radius: 3px;
+    transition: background 0.2s ease;
+  }
+  
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.35);
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes glow {
+  from {
+    box-shadow: 0 0 10px hsl(var(--gamora-green-glow) / 0.3);
+  }
+  to {
+    box-shadow: 0 0 30px hsl(var(--gamora-green-glow) / 0.6);
+  }
+}
