@@ -27,7 +27,7 @@ const Header = () => {
 
   return (
     <>
-      <header className="sticky top-0 z-50 w-full bg-background/80 backdrop-blur-xl border-b border-border/50">
+      <header className="sticky top-0 z-50 w-full bg-black border-b border-border/50">
         <div className="container flex h-16 items-center justify-between px-6">
           {/* Logo */}
           <div className="flex items-center space-x-3">
