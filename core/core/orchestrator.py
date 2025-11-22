@@ -387,20 +387,13 @@ class MasterOrchestrator:
             error_msg = str(e)
             logger.error(f"Game generation failed for {project_id}: {error_msg}")
             await self._update_status(project_id, "failed", f"Generation failed: {error_msg}")
-                if db_manager:
+            if db_manager:
                 await db_manager.update_project(project_id, status="failed")
                 await self._log_step(db_manager, project_id, "generation", "failed", error=error_msg)
-                return {
-                "success": False,
-                    "project_id": project_id,
-                "error": error_msg,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-            
             return {
                 "success": False,
                 "project_id": project_id,
-                "error": str(e),
+                "error": error_msg,
                 "timestamp": datetime.utcnow().isoformat()
             }
     
@@ -1406,11 +1399,11 @@ Return ONLY valid JSON. No markdown. Make levels fun, balanced, and well-designe
     def _create_fallback_scripts(self, design: Dict, mechanics: Dict) -> Dict:
         """Create fallback game scripts - returns structure for web game service"""
         # Web game service will generate code directly
-            return {
+        return {
             "scripts_generated_by": "web_game_service",
             "use_ai": True,
             "custom_scripts": {}
-            }
+        }
     
     def _create_fallback_ui_design(self, design: Dict) -> Dict:
         """Create fallback UI design"""
