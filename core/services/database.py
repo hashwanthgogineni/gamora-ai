@@ -47,7 +47,7 @@ class DatabaseManager:
     
     async def create_tables(self):
         """Create database schema - Run this SQL in Supabase SQL Editor"""
-        logger.info("ℹ️  Please run the SQL schema in Supabase SQL Editor (see core/supabase_schema.sql)")
+        logger.info("ℹ️  Please run the SQL schema in Supabase SQL Editor")
         # Tables are created via Supabase SQL Editor, not programmatically
         # This is a placeholder to maintain compatibility
     

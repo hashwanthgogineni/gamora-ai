@@ -28,6 +28,8 @@ export default function GamoraAIDashboard() {
   const [isLoading, setIsLoading] = useState(false);
   const [currentStatus, setCurrentStatus] = useState<string>('');
   const [currentProjectId, setCurrentProjectId] = useState<string | null>(projectId || null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [gameHtmlContent, setGameHtmlContent] = useState<string | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -50,7 +52,7 @@ export default function GamoraAIDashboard() {
     
     switch (update.type) {
       case 'connected':
-        setCurrentStatus('Connected to Gamora AI. Starting game generation...');
+        setCurrentStatus('Game Generation In Progress...');
         // Don't add message to chat - keep static message
         break;
         
@@ -71,8 +73,18 @@ export default function GamoraAIDashboard() {
         setIsLoading(false);
         setCurrentStatus('Completed');
         const { project_id } = update.data;
+        const previewUrlFromUpdate = (update.data as any).preview_url || update.data.web_preview_url;
         if (project_id) {
           setCurrentProjectId(project_id);
+          // Fetch preview URL if not in update
+          if (previewUrlFromUpdate) {
+            setPreviewUrl(previewUrlFromUpdate);
+            // Load HTML content directly for better rendering
+            loadGameHtml(previewUrlFromUpdate);
+          } else {
+            // Fetch preview URL from API
+            fetchPreviewUrl(project_id);
+          }
         }
         // Update chat with completion message (only once)
         if (!completionMessageAddedRef.current) {
@@ -152,6 +164,8 @@ export default function GamoraAIDashboard() {
 
       // Update project ID
       setCurrentProjectId(response.project_id);
+      setPreviewUrl(null); // Reset preview URL for new game
+      setGameHtmlContent(null); // Reset HTML content
 
       apiClient.createWebSocketConnection(response.project_id, (update: ProgressUpdate) => {
         handleWebSocketUpdate(update);
@@ -170,6 +184,86 @@ export default function GamoraAIDashboard() {
     }
   };
 
+  const handleDownloadGame = async () => {
+    if (!currentProjectId) {
+      console.error('No project ID available');
+      addBotMessage('❌ No game available to download. Please generate a game first.');
+      return;
+    }
+
+    try {
+      addBotMessage('Preparing game files for download...');
+
+      // Get auth token for download endpoint
+      const { createClient } = await import('@supabase/supabase-js');
+      const supabase = createClient(
+        import.meta.env.VITE_SUPABASE_URL || '',
+        import.meta.env.VITE_SUPABASE_ANON_KEY || ''
+      );
+      
+      const { data: { session } } = await supabase.auth.getSession();
+      const token = session?.access_token;
+
+      if (!token) {
+        addBotMessage('❌ Please sign in to download games.');
+        return;
+      }
+
+      // Call backend download endpoint for HTML5 games (ZIP)
+      const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+      const downloadUrl = `${API_BASE_URL}/api/v1/generate/download-web/${currentProjectId}`;
+      
+      // Download with proper error handling and progress
+      addBotMessage('Downloading game files...');
+      
+      const response = await fetch(downloadUrl, {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        let errorMessage = `Download failed: ${response.statusText}`;
+        
+        try {
+          const errorJson = JSON.parse(errorText);
+          errorMessage = errorJson.detail || errorMessage;
+        } catch {
+          // Use default error message
+        }
+        
+        throw new Error(errorMessage);
+      }
+
+      // Get filename from Content-Disposition header or use default
+      const contentDisposition = response.headers.get('content-disposition');
+      let filename = `game_${currentProjectId}.zip`;
+      if (contentDisposition) {
+        const filenameMatch = contentDisposition.match(/filename="?(.+?)"?$/);
+        if (filenameMatch) {
+          filename = filenameMatch[1];
+        }
+      }
+
+      // Download as blob and create download link
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+
+      addBotMessage('Game downloaded successfully! Extract the ZIP file and open index.html in your browser.');
+    } catch (error) {
+      console.error('Download error:', error);
+      addBotMessage(`❌ Download failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  };
+
   const handleDownload = async () => {
     if (!currentProjectId) {
       console.error('No project ID available');
@@ -178,19 +272,9 @@ export default function GamoraAIDashboard() {
     }
 
     try {
-      // Detect user's platform for best compatibility
-      const userPlatform = navigator.platform.toLowerCase();
-      let platform = 'windows'; // Default to Windows EXE (highest quality)
-      
-      if (userPlatform.includes('win')) {
-        platform = 'windows';
-      } else if (userPlatform.includes('mac')) {
-        platform = 'macos';
-      } else if (userPlatform.includes('android') || userPlatform.includes('linux')) {
-        platform = 'android';
-      } else {
-        platform = 'web'; // Fallback to web build
-      }
+      // PROTOTYPE MODE: Always use Windows build
+      const platform = 'windows';
+      addBotMessage('📥 Starting download... (Windows EXE)');
 
       // Get auth token for download endpoint
       const { createClient } = await import('@supabase/supabase-js');
@@ -211,12 +295,9 @@ export default function GamoraAIDashboard() {
       const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
       const downloadUrl = `${API_BASE_URL}/api/v1/generate/download/${currentProjectId}?platform=${platform}`;
       
-      // Create a temporary link and trigger download
-      const link = document.createElement('a');
-      link.href = downloadUrl;
-      link.download = `${currentProjectId}_${platform}.${platform === 'windows' ? 'exe' : platform === 'android' ? 'apk' : 'zip'}`;
+      // Download with proper error handling and progress
+      addBotMessage('⏳ Downloading game file...');
       
-      // Add auth header via fetch, then create blob URL
       const response = await fetch(downloadUrl, {
         headers: {
           'Authorization': `Bearer ${token}`
@@ -224,21 +305,93 @@ export default function GamoraAIDashboard() {
       });
 
       if (!response.ok) {
-        throw new Error(`Download failed: ${response.statusText}`);
+        const errorText = await response.text();
+        let errorMessage = `Download failed: ${response.statusText}`;
+        
+        try {
+          const errorJson = JSON.parse(errorText);
+          errorMessage = errorJson.detail || errorMessage;
+        } catch {
+          // Use default error message
+        }
+        
+        throw new Error(errorMessage);
       }
 
+      // Check if response has content
+      const contentLength = response.headers.get('content-length');
+      if (contentLength && parseInt(contentLength) === 0) {
+        throw new Error('Downloaded file is empty. The build may not be ready yet.');
+      }
+
+      // Get blob with progress tracking
       const blob = await response.blob();
+      
+      if (!blob || blob.size === 0) {
+        throw new Error('Downloaded file is empty. Please try again.');
+      }
+
+      // Create download link
       const blobUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
       link.href = blobUrl;
+      link.download = `${currentProjectId}_windows.exe`;
+      link.style.display = 'none';
+      
       document.body.appendChild(link);
       link.click();
-      document.body.removeChild(link);
-      window.URL.revokeObjectURL(blobUrl);
+      
+      // Cleanup
+      setTimeout(() => {
+        document.body.removeChild(link);
+        window.URL.revokeObjectURL(blobUrl);
+      }, 100);
 
-      addBotMessage(`✅ Download started! Your ${platform} game is downloading.`);
+      const fileSizeMB = (blob.size / 1024 / 1024).toFixed(2);
+      addBotMessage(`✅ Download complete! File size: ${fileSizeMB} MB`);
     } catch (error: any) {
       console.error('Download failed:', error);
-      addBotMessage(`❌ Download failed: ${error.message || 'Unknown error'}`);
+      const errorMessage = error.message || 'Unknown error occurred';
+      addBotMessage(`❌ Download failed: ${errorMessage}. Please try again or contact support.`);
+    }
+  };
+
+  const fetchPreviewUrl = async (projectId: string) => {
+    try {
+      const project = await apiClient.getProject(projectId);
+      if (project.web_preview_url) {
+        setPreviewUrl(project.web_preview_url);
+        // Also try to load HTML content directly for better rendering
+        await loadGameHtml(project.web_preview_url);
+      } else {
+        // Fallback: construct preview URL from project ID
+        const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+        const previewUrl = `${API_BASE_URL}/api/v1/generate/preview/${projectId}`;
+        setPreviewUrl(previewUrl);
+        await loadGameHtml(previewUrl);
+      }
+    } catch (error) {
+      console.error('Failed to fetch preview URL:', error);
+      // Fallback: construct preview URL from project ID
+      const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+      const previewUrl = `${API_BASE_URL}/api/v1/generate/preview/${projectId}`;
+      setPreviewUrl(previewUrl);
+      await loadGameHtml(previewUrl);
+    }
+  };
+
+  const loadGameHtml = async (url: string) => {
+    try {
+      const response = await fetch(url);
+      if (response.ok) {
+        const html = await response.text();
+        setGameHtmlContent(html);
+        console.log('✅ Loaded game HTML content');
+      } else {
+        console.error('Failed to load game HTML:', response.status);
+      }
+    } catch (error) {
+      console.error('Error loading game HTML:', error);
     }
   };
 
@@ -332,13 +485,13 @@ export default function GamoraAIDashboard() {
         </div>
       </div>
 
-      {/* Right Download Panel */}
+      {/* Right Preview Panel */}
       <div className="w-[65%] flex flex-col items-center justify-center bg-black relative">
         {isLoading ? (
           <div className="flex flex-col items-center justify-center h-full w-full">
             <div className="flex flex-col items-center mb-4">
               <p className="text-white text-xl font-light">{currentStatus || 'Cooking your Game...'}</p>
-              <p className="text-gray-400 text-sm font-light mt-1">(Might take 2-3 minutes)</p>
+              <p className="text-gray-400 text-sm font-light mt-1">(Might take 3-4 minutes)</p>
             </div>
             <div className="border border-[#25D366] rounded-sm p-[3px] w-[260px]">
               <div className="flex gap-[3px] bg-black p-[2px]">
@@ -359,52 +512,93 @@ export default function GamoraAIDashboard() {
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
             transition={{ duration: 0.4 }}
-            className="flex flex-col items-center text-center w-full"
+            className="flex flex-col items-center w-full h-full py-6"
           >
-            {currentProjectId ? (
+            {currentProjectId && previewUrl ? (
               <>
-                <div className="flex flex-col items-center mb-8">
-                  <Gamepad2 size={64} className="text-green-500 mb-4" />
-                  <h2 className="text-2xl mb-2 text-green-500 font-light">
-                    Your Game is Ready!
-                  </h2>
-                  <p className="text-gray-400 text-sm font-light mb-6 max-w-md">
-                    Download your game and run it locally. The file is optimized for your platform with high quality and compatibility.
-                  </p>
-                  
+                <div className="flex items-center justify-end w-full px-6 pt-6 pb-6">
                   <button
-                    onClick={handleDownload}
+                    onClick={handleDownloadGame}
                     className="
-                      flex items-center gap-3
-                      bg-green-500 text-black
-                      px-8 py-4 rounded-lg font-medium text-lg
-                      transition-all duration-300
-                      hover:bg-green-400 hover:scale-105 hover:shadow-lg
-                      active:scale-95
-                      disabled:opacity-50 disabled:cursor-not-allowed
+                      bg-black text-green-500 border border-green-500 
+                      px-6 py-3 rounded-sm font-light
+                      transition-colors duration-300
+                      hover:bg-green-500 hover:text-black
+                      flex items-center gap-2
                     "
                   >
-                    <Download size={24} />
+                    <Download size={18} />
                     Download Game
                   </button>
-                  
-                  {/* <p className="text-gray-500 text-xs font-light mt-4">
-                    {navigator.platform.toLowerCase().includes('win') 
-                      ? 'Game file - Ready to run'
-                      : navigator.platform.toLowerCase().includes('mac')
-                      ? 'Mac build - Ready to run'
-                      : 'Optimized build for your platform'}
-                  </p> */}
+                </div>
+                <div className="flex-1 w-full px-6 pt-6 pb-6 relative flex items-center justify-center">
+                  {gameHtmlContent ? (
+                    // Render HTML directly in a sandboxed iframe using srcdoc
+                    <iframe
+                      key={previewUrl}
+                      srcDoc={gameHtmlContent}
+                      className="w-full h-full max-w-full max-h-full border-0 rounded-lg bg-black"
+                      title="Game Preview"
+                      allow="gamepad; fullscreen; autoplay; microphone; camera"
+                      sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-modals allow-downloads allow-presentation"
+                      style={{ 
+                        border: 'none',
+                        display: 'block',
+                        width: '100%',
+                        height: '100%',
+                        minHeight: '500px'
+                      }}
+                      onLoad={() => {
+                        console.log('✅ Game rendered successfully');
+                      }}
+                      onError={(e) => {
+                        console.error('❌ Game render error:', e);
+                      }}
+                    />
+                  ) : (
+                    // Fallback to URL-based iframe if HTML content not loaded
+                    <iframe
+                      key={previewUrl}
+                      src={previewUrl}
+                      className="w-full h-full max-w-full max-h-full border-0 rounded-lg bg-black"
+                      title="Game Preview"
+                      allow="gamepad; fullscreen; autoplay; microphone; camera"
+                      sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-modals allow-downloads allow-presentation"
+                      style={{ 
+                        border: 'none',
+                        display: 'block',
+                        width: '100%',
+                        height: '100%',
+                        minHeight: '500px'
+                      }}
+                      onLoad={() => {
+                        console.log('✅ Iframe loaded successfully:', previewUrl);
+                      }}
+                      onError={(e) => {
+                        console.error('❌ Iframe load error:', e);
+                      }}
+                    />
+                  )}
                 </div>
               </>
+            ) : currentProjectId ? (
+              <div className="flex flex-col items-center justify-center h-full">
+                <Gamepad2 size={64} className="text-gray-600 mb-4" />
+                <h2 className="text-xl mb-2 text-gray-400 font-light">
+                  Game is Generating...
+                </h2>
+                <p className="text-gray-500 text-sm font-light">
+                  Preview will appear here when ready
+                </p>
+              </div>
             ) : (
-              <div className="flex flex-col items-center">
+              <div className="flex flex-col items-center justify-center h-full">
                 <Gamepad2 size={64} className="text-gray-600 mb-4" />
                 <h2 className="text-xl mb-2 text-gray-400 font-light">
                   No Game Generated Yet
                 </h2>
                 <p className="text-gray-500 text-sm font-light">
-                  Generate a game to download it here
+                  Generate a game to preview it here
                 </p>
               </div>
             )}

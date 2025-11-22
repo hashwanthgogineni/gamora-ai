@@ -34,6 +34,7 @@ export interface ProgressUpdate {
     progress?: number;
     step?: string;
     web_preview_url?: string;
+    preview_url?: string;
     builds?: Record<string, string>;
     error?: string;
     project_id?: string;

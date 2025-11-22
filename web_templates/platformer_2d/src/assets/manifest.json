@@ -1,0 +1,9 @@
+{
+  "player": null,
+  "enemy": null,
+  "collectible": null,
+  "platform": null,
+  "background": null,
+  "ui": {}
+}
+

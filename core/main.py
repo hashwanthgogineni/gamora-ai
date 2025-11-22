@@ -1,12 +1,8 @@
-"""
-Gamora AI Backend - Main Application
-Ultimate game generation platform with ChatGPT-4 + DeepSeek R1
-"""
+"""Gamora AI Backend - Main Application"""
 
-import os
-import asyncio
 from contextlib import asynccontextmanager
 from typing import Dict, Any
+from pathlib import Path
 import logging
 from datetime import datetime
 
@@ -17,14 +13,12 @@ from fastapi.responses import JSONResponse
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 import uvicorn
 
-# Import core modules
 from core.orchestrator import MasterOrchestrator
 from core.auth import AuthManager
 from core.rate_limiter import RateLimiter
 from core.websocket_manager import WebSocketManager
 from services.database import DatabaseManager
 from services.cache import CacheManager
-from services.godot_service import GodotService
 from services.storage import StorageService
 from api.routes import (
     auth_router,
@@ -33,29 +27,22 @@ from api.routes import (
 )
 from config.settings import Settings
 from utils.logger import setup_logger
-
-# Initialize logger
-logger = setup_logger(__name__)
-
-# Prometheus metrics (register only once to avoid duplicates)
-# Check registry first to avoid duplicate registration errors
 from prometheus_client import REGISTRY
 
+logger = setup_logger(__name__)
+components: Dict[str, Any] = {}
+
+
 def get_or_create_metric(metric_class, name, description, *args, **kwargs):
-    """Get existing metric from registry or create new one"""
-    # Check if metric already exists in registry
     for collector in list(REGISTRY._collector_to_names.keys()):
         if hasattr(collector, '_name') and collector._name == name:
             return collector
-    # If not found, create new metric
     try:
         return metric_class(name, description, *args, **kwargs)
     except ValueError:
-        # If registration fails, try to find it again (might have been registered by another thread)
         for collector in list(REGISTRY._collector_to_names.keys()):
             if hasattr(collector, '_name') and collector._name == name:
                 return collector
-        # If still not found, create a no-op metric wrapper to prevent crashes
         logger.warning(f"Could not register metric {name}, using no-op wrapper")
         class NoOpMetric:
             def labels(self, *args, **kwargs):
@@ -71,30 +58,22 @@ REQUEST_LATENCY = get_or_create_metric(Histogram, 'gamoraai_request_latency_seco
 GENERATION_COUNT = get_or_create_metric(Counter, 'gamoraai_generations_total', 'Total generations', ['status'])
 GENERATION_TIME = get_or_create_metric(Histogram, 'gamoraai_generation_time_seconds', 'Generation time')
 
-# Global components
-components: Dict[str, Any] = {}
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan manager"""
     logger.info("🚀 Starting Gamora AI Backend...")
     
-    # Load settings
     settings = Settings()
     
-    # Initialize database (Supabase)
     logger.info("📊 Connecting to Supabase...")
     db_manager = DatabaseManager(settings.supabase_url, settings.supabase_key)
     await db_manager.connect()
-    await db_manager.create_tables()  # Note: Run SQL schema manually in Supabase
+    await db_manager.create_tables()
     
-    # Initialize cache (in-memory)
     logger.info("🔄 Initializing cache...")
     cache_manager = CacheManager()
     await cache_manager.connect()
     
-    # Initialize storage (Supabase)
     logger.info("💾 Connecting to Supabase Storage...")
     storage_service = StorageService(
         supabase_url=settings.supabase_url,
@@ -103,56 +82,58 @@ async def lifespan(app: FastAPI):
     )
     await storage_service.connect()
     
-    # Initialize Godot service (optional - backend can run without it)
-    logger.info("🎮 Starting Godot Service...")
-    godot_service = None
-    try:
-        godot_service = GodotService(
-            godot_path=settings.godot_path,
-            projects_dir=settings.projects_dir
-        )
-        await godot_service.start()
-        logger.info("✅ Godot Service started successfully")
-    except Exception as e:
-        logger.warning(f"⚠️  Godot Service not available: {e}")
-        logger.warning("   Backend will run without game builds. AI generation will still work.")
-        logger.warning("   Install Godot and set GODOT_PATH to enable game builds.")
-    
-    # Initialize authentication (Supabase)
     logger.info("🔐 Setting up authentication...")
     auth_manager = AuthManager(settings.supabase_url, settings.supabase_anon_key)
     await auth_manager.initialize()
     
-    # Initialize rate limiter
     logger.info("⏱️  Setting up rate limiter...")
     rate_limiter = RateLimiter(cache_manager)
     
-    # Initialize WebSocket manager
     logger.info("🔌 Setting up WebSocket manager...")
     ws_manager = WebSocketManager()
     
-    # Initialize master orchestrator
-    logger.info("🤖 Initializing AI Orchestrator (DeepSeek R1 Primary + OpenAI for Assets)...")
+    logger.info("🌐 Initializing Web Game Service...")
+    from services.web_game_service import WebGameService
+    web_game_service = WebGameService(
+        projects_dir=settings.projects_dir.replace("projects", "web_projects"),
+        templates_dir="./web_templates"
+    )
+    await web_game_service.start()
+    
+    logger.info("🤖 Initializing AI Orchestrator...")
     orchestrator = MasterOrchestrator(
-        openai_api_key=settings.openai_api_key,
         deepseek_api_key=settings.deepseek_api_key,
         cache_manager=cache_manager,
-        godot_service=godot_service,
         storage_service=storage_service,
-        ws_manager=ws_manager
+        ws_manager=ws_manager,
+        web_game_service=web_game_service,
+        enable_ai_assets=settings.enable_ai_assets if hasattr(settings, 'enable_ai_assets') else True
     )
     await orchestrator.initialize()
     
-    # Store components globally
+    logger.info("🧹 Initializing project cleanup service...")
+    from services.project_cleanup import ProjectCleanupService
+    cleanup_service = ProjectCleanupService(
+        projects_dir=Path(settings.projects_dir),
+        db_manager=db_manager
+    )
+    
+    try:
+        cleanup_stats = await cleanup_service.cleanup_on_startup()
+        if cleanup_stats['deleted'] > 0:
+            logger.info(f"🧹 Cleaned up {cleanup_stats['deleted']} old projects, freed {cleanup_stats['space_freed_mb']:.2f} MB")
+    except Exception as e:
+        logger.warning(f"⚠️  Cleanup service error: {e}")
+    
     components['settings'] = settings
     components['db'] = db_manager
     components['cache'] = cache_manager
     components['storage'] = storage_service
-    components['godot'] = godot_service
     components['auth'] = auth_manager
     components['rate_limiter'] = rate_limiter
     components['ws_manager'] = ws_manager
     components['orchestrator'] = orchestrator
+    components['cleanup'] = cleanup_service
     
     logger.info("✅ Gamora AI Backend started successfully!")
     logger.info(f"📍 Server running on {settings.host}:{settings.port}")
@@ -160,20 +141,17 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Cleanup on shutdown
     logger.info("🛑 Shutting down Gamora AI Backend...")
     await orchestrator.shutdown()
-    await godot_service.stop()
     await storage_service.disconnect()
     await cache_manager.disconnect()
     await db_manager.disconnect()
     logger.info("✅ Shutdown complete")
 
 
-# Create FastAPI app
 app = FastAPI(
     title="Gamora AI Backend",
-    description="Ultimate AI-Powered Game Generation Platform | DeepSeek R1 (Primary) + OpenAI (Assets)",
+    description="AI-Powered Game Generation Platform",
     version="2.0.0",
     lifespan=lifespan,
     docs_url="/docs",
@@ -181,10 +159,9 @@ app = FastAPI(
     openapi_url="/openapi.json"
 )
 
-# Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -194,7 +171,6 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 @app.middleware("http")
 async def metrics_middleware(request, call_next):
-    """Track request metrics"""
     start_time = datetime.utcnow()
     response = await call_next(request)
     latency = (datetime.utcnow() - start_time).total_seconds()
@@ -209,21 +185,18 @@ async def metrics_middleware(request, call_next):
     return response
 
 
-# Include routers
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["Authentication"])
 app.include_router(projects_router, prefix="/api/v1/projects", tags=["Projects"])
 app.include_router(generation_router, prefix="/api/v1/generate", tags=["Generation"])
 
 
-# Root endpoints
 @app.get("/")
 async def root():
-    """Root endpoint"""
     return {
         "name": "Gamora AI Backend",
         "version": "2.0.0",
         "status": "operational",
-        "ai_models": ["DeepSeek-R1 (Primary)", "DALL-E-3 (Assets)"],
+        "ai_models": ["DeepSeek"],
         "docs": "/docs",
         "health": "/health"
     }
@@ -231,18 +204,15 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Comprehensive health check"""
     health_status = {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "services": {}
     }
     
-    # Check all services
     services = {
         "database": components.get('db'),
         "cache": components.get('cache'),
-        "godot": components.get('godot'),
         "storage": components.get('storage')
     }
     
@@ -262,24 +232,20 @@ async def health_check():
 
 @app.get("/metrics")
 async def metrics():
-    """Prometheus metrics endpoint"""
     from starlette.responses import Response
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/stats")
 async def get_stats():
-    """Get system statistics"""
     stats = {
         "timestamp": datetime.utcnow().isoformat(),
         "version": "2.0.0",
         "ai_models": {
-            "primary": "DeepSeek-R1",
-            "image_generation": "DALL-E-3"
+            "primary": "DeepSeek"
         }
     }
     
-    # Get component stats if available
     if 'cache' in components:
         stats["cache"] = await components['cache'].get_stats()
     if 'db' in components:
@@ -290,10 +256,8 @@ async def get_stats():
     return stats
 
 
-# Global exception handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
-    """Handle all unhandled exceptions"""
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,
@@ -306,7 +270,6 @@ async def global_exception_handler(request, exc):
 
 
 def get_components():
-    """Dependency to get global components"""
     return components
 
 

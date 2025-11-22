@@ -42,20 +42,25 @@ class Settings(BaseSettings):
             raise ValueError("SUPABASE_KEY or VITE_SUPABASE_SERVICE_KEY is required")
         if not self.supabase_anon_key:
             raise ValueError("SUPABASE_ANON_KEY or VITE_SUPABASE_ANON_KEY is required")
+        if not self.deepseek_api_key:
+            raise ValueError("DEEPSEEK_API_KEY is required in .env file")
     
     # Storage
     storage_bucket: str = "gamoraai-projects"
     
     # AI API Keys (REQUIRED)
-    openai_api_key: str
+    # Loads from DEEPSEEK_API_KEY environment variable in .env file
     deepseek_api_key: str
     
-    # Godot
-    godot_path: str = "/usr/local/bin/godot"
+    # Projects
     projects_dir: str = "./projects"
     
     # Monitoring (Optional)
     sentry_dsn: str = ""
+    
+    # AI Asset Generation (Optional - defaults to False)
+    enable_ai_assets: bool = False  # DALL-E disabled - DeepSeek used for descriptions only
+    ai_asset_tier: str = "premium"  # Minimum tier to use AI assets (free/premium/pro)
     
     class Config:
         env_file = ".env"

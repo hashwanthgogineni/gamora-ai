@@ -1,8 +1,3 @@
-"""
-Asset Manager Agent - DALL-E 3 Integration + Free Asset Store Integration
-Generates game assets using DALL-E 3, free asset stores, and enhanced procedural generation
-"""
-
 from typing import Dict, List, Any, Optional
 from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 from io import BytesIO
@@ -18,11 +13,16 @@ logger = logging.getLogger(__name__)
 
 
 class AssetManagerAgent:
-    """Asset generation with DALL-E 3 + Free Asset Stores + Enhanced Procedural"""
-    
-    def __init__(self, openai_client, storage_service):
-        self.openai = openai_client
+    # Manages game asset generation
+    def __init__(self, openai_client, storage_service, enable_ai_assets: bool = False):
+        # DeepSeek client - used only for descriptions
+        # Extract the actual AsyncOpenAI client if it's wrapped
+        if hasattr(openai_client, 'client'):
+            self.deepseek = openai_client  # DeepSeekClient wrapper
+        else:
+            self.openai = openai_client  # Direct AsyncOpenAI client
         self.storage = storage_service
+        self.enable_ai_assets = enable_ai_assets  # DALL-E 3 disabled - not used
         
         # Asset storage configuration
         self.asset_bucket = "gamoraai-assets"  # Separate bucket for assets
@@ -41,41 +41,37 @@ class AssetManagerAgent:
             "craftpix": "https://craftpix.net/freebies",  # Free game assets
         }
         
-        logger.info("✅ Asset Manager initialized with Supabase Storage + DALL-E 3")
+        logger.info(f"Asset Manager initialized with Supabase Storage (DeepSeek for descriptions only)")
     
     async def generate_assets(self, game_design: Dict, user_tier: str = "premium", deepseek_client=None):
-        """
-        Generate assets using Curated Asset Library (Priority 1):
-        - First: Match and use curated assets from library
-        - Fallback: Enhanced procedural generation
-        - Premium: DALL-E 3 for hero (optional, if curated not available)
-        
-        Strategy:
-        1. Load curated asset index
-        2. Match game design to curated assets
-        3. Copy selected assets from library
-        4. Fallback to procedural if no matches
-        """
-        
+        # Generates assets using procedural generation
         assets = []
-        
-        # Priority 1: Use curated assets from library
-        curated_assets = await self._get_curated_assets(game_design)
-        if curated_assets:
-            assets.extend(curated_assets)
-            logger.info(f"✅ Matched {len(curated_assets)} assets from curated library")
-        
-        # If we have all essential assets, return them
         essential_types = ['player', 'enemy', 'collectible', 'platform']
-        found_types = {asset.get('type', '') for asset in assets}
-        if all(etype in found_types for etype in essential_types):
-            logger.info("✅ All essential assets found in curated library")
-            return self._validate_assets(assets)
         
-        # Fallback: Generate missing assets procedurally
+        # DALL-E 3 is disabled - skip image generation
+        # DeepSeek is used only for generating asset descriptions
+        
+        # Check what we have
+        found_types = {asset.get('type', '') for asset in assets}
         missing_types = [etype for etype in essential_types if etype not in found_types]
+        
+        # Priority 2: Use curated assets for missing types
         if missing_types:
-            logger.info(f"⚠️  Missing asset types, generating procedurally: {missing_types}")
+            try:
+                curated_assets = await self._get_curated_assets(game_design)
+                if curated_assets:
+                    for curated_asset in curated_assets:
+                        asset_type = curated_asset.get('type', '')
+                        if asset_type in missing_types:
+                            assets.append(curated_asset)
+                            missing_types.remove(asset_type)
+                            logger.info(f"Added curated {asset_type}")
+            except Exception as e:
+                logger.warning(f"Failed to get curated assets: {e}")
+        
+        # Priority 3: Generate missing assets procedurally
+        if missing_types:
+            logger.info(f"Missing asset types, generating procedurally: {missing_types}")
             try:
                 # Use AI descriptions for better procedural generation
                 if deepseek_client:
@@ -85,36 +81,74 @@ class AssetManagerAgent:
                 
                 procedural = await self._generate_enhanced_procedural_assets(game_design, asset_descriptions)
                 if procedural:
-                    assets.extend(procedural)
+                    # Only add procedural assets for missing types
+                    for proc_asset in procedural:
+                        if proc_asset.get('type') in missing_types:
+                            assets.append(proc_asset)
+                            logger.info(f"Added procedural {proc_asset.get('type')}")
             except Exception as e:
                 logger.error(f"Failed to generate procedural assets: {e}", exc_info=True)
-                fallback_assets = self._generate_fallback_assets(game_design)
-                assets.extend(fallback_assets)
         
-        # Ensure we have at least basic assets
-        if len(assets) == 0:
-            logger.warning("No assets generated, creating fallback assets")
+        # CRITICAL: Ensure we have at least basic fallback assets for ALL essential types
+        final_found_types = {asset.get('type', '') for asset in assets}
+        still_missing = [etype for etype in essential_types if etype not in final_found_types]
+        
+        if still_missing:
+            logger.warning(f"Still missing assets after all attempts: {still_missing}, using fallback")
             fallback_assets = self._generate_fallback_assets(game_design)
-            assets.extend(fallback_assets)
+            # Only add fallback for missing types
+            for fallback_asset in fallback_assets:
+                if fallback_asset.get('type') in still_missing:
+                    assets.append(fallback_asset)
+                    logger.info(f"Added fallback {fallback_asset.get('type')}")
         
+        # Final validation - ensure we have ALL essential assets
         validated_assets = self._validate_assets(assets)
-        logger.info(f"✅ Generated {len(validated_assets)} validated assets (tier: {user_tier})")
+        final_types = {asset.get('type', '') for asset in validated_assets}
+        
+        if not all(etype in final_types for etype in essential_types):
+            logger.error(f"CRITICAL: Still missing essential assets after all fallbacks! Missing: {[t for t in essential_types if t not in final_types]}")
+            # Last resort: generate ALL fallback assets
+            all_fallback = self._generate_fallback_assets(game_design)
+            validated_assets = self._validate_assets(all_fallback)
+            logger.warning("Using ONLY fallback assets - something went wrong with asset generation")
+        
+        logger.info(f"Generated {len(validated_assets)} validated assets (tier: {user_tier})")
+        logger.info(f"   Asset types: {', '.join(sorted({a.get('type', 'unknown') for a in validated_assets}))}")
         return validated_assets
     
     def _validate_assets(self, assets: List[Dict]) -> List[Dict]:
-        """Validate all assets have required fields"""
+        """Validate all assets have required fields and data"""
         validated_assets = []
         for asset in assets:
             if not isinstance(asset, dict):
-                logger.warning(f"Invalid asset format: {asset}")
+                logger.warning(f"Invalid asset format (not dict): {type(asset)}")
                 continue
             if 'path' not in asset:
-                logger.warning(f"Asset missing path: {asset}")
+                logger.warning(f"Asset missing path: {asset.get('type', 'unknown')}")
                 continue
-            if 'data' not in asset and 'content' not in asset:
+            
+            # Check for data or content
+            has_data = 'data' in asset and asset.get('data') is not None
+            has_content = 'content' in asset and asset.get('content')
+            
+            if not has_data and not has_content:
                 logger.warning(f"Asset missing data/content: {asset.get('path', 'unknown')}")
                 continue
+            
+            # Validate data is not empty
+            if has_data:
+                data = asset.get('data')
+                if isinstance(data, bytes) and len(data) == 0:
+                    logger.warning(f"Asset has empty data: {asset.get('path', 'unknown')}")
+                    continue
+                elif not isinstance(data, bytes):
+                    logger.warning(f"Asset data is not bytes: {asset.get('path', 'unknown')}, type: {type(data)}")
+                    continue
+            
             validated_assets.append(asset)
+        
+        logger.info(f"Validated {len(validated_assets)}/{len(assets)} assets")
         return validated_assets
     
     def _load_asset_index(self) -> Dict:
@@ -129,7 +163,7 @@ class AssetManagerAgent:
                 index_data = self.storage.client.storage.from_(self.asset_bucket).download("metadata/index.json")
                 if index_data:
                     self.asset_index = json.loads(index_data.decode('utf-8'))
-                    logger.info(f"✅ Loaded asset index from Supabase: {len(self.asset_index.get('assets', []))} assets")
+                    logger.info(f"Loaded asset index from Supabase: {len(self.asset_index.get('assets', []))} assets")
                     return self.asset_index
             except Exception as e:
                 logger.warning(f"Failed to load asset index from Supabase: {e}, trying local fallback...")
@@ -142,7 +176,7 @@ class AssetManagerAgent:
         try:
             with open(self.asset_index_path, 'r', encoding='utf-8') as f:
                 self.asset_index = json.load(f)
-            logger.info(f"✅ Loaded asset index from local: {len(self.asset_index.get('assets', []))} assets")
+            logger.info(f"Loaded asset index from local: {len(self.asset_index.get('assets', []))} assets")
             return self.asset_index
         except Exception as e:
             logger.error(f"Failed to load asset index: {e}")
@@ -288,11 +322,29 @@ class AssetManagerAgent:
                 if self.use_supabase_assets and self.storage and self.storage.client:
                     try:
                         storage_path = f"curated/{asset_path.replace('\\', '/')}"
-                        asset_data = self.storage.client.storage.from_(self.asset_bucket).download(storage_path)
-                        if asset_data:
-                            logger.debug(f"✅ Fetched {asset_type} from Supabase: {storage_path}")
+                        downloaded = self.storage.client.storage.from_(self.asset_bucket).download(storage_path)
+                        
+                        # Handle different return types from Supabase
+                        if downloaded:
+                            if isinstance(downloaded, bytes):
+                                asset_data = downloaded
+                            elif isinstance(downloaded, str):
+                                asset_data = downloaded.encode('utf-8')
+                            else:
+                                # Try to convert to bytes
+                                asset_data = bytes(downloaded) if downloaded else None
+                            
+                            if asset_data and len(asset_data) > 0:
+                                logger.info(f"Fetched {asset_type} from Supabase: {storage_path} ({len(asset_data)} bytes)")
+                            else:
+                                asset_data = None
+                                logger.warning(f"Empty asset data from Supabase: {storage_path}")
+                        else:
+                            asset_data = None
+                            logger.warning(f"No data returned from Supabase: {storage_path}")
                     except Exception as e:
                         logger.warning(f"Failed to fetch {asset_path} from Supabase: {e}, trying local fallback...")
+                        asset_data = None
                 
                 # Local fallback
                 if not asset_data:
@@ -304,7 +356,7 @@ class AssetManagerAgent:
                     try:
                         with open(full_path, 'rb') as f:
                             asset_data = f.read()
-                        logger.debug(f"✅ Loaded {asset_type} from local: {full_path}")
+                        logger.debug(f"Loaded {asset_type} from local: {full_path}")
                     except Exception as e:
                         logger.error(f"Failed to read asset {full_path}: {e}")
                         continue
@@ -359,7 +411,7 @@ Generate detailed visual descriptions for each asset type that:
 1. Match the game's art style exactly
 2. Use the specified color scheme
 3. Are consistent with each other
-4. Are detailed enough to generate procedurally or with DALL-E
+4. Are detailed enough to generate procedurally
 
 Return JSON with:
 - player: {{description: string, colors: [hex], style_notes: string, size: "64x64"}}
@@ -380,31 +432,37 @@ Create REFINED, DETAILED descriptions that will produce high-quality assets:"""
             if not content:
                 logger.warning("Empty response from AI, using fallback descriptions")
                 return self._generate_basic_asset_descriptions(game_design)
-            
-            # Extract JSON from markdown code blocks
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                # Try to extract from any code block
-                parts = content.split("```")
-                if len(parts) >= 3:
-                    content = parts[1].strip()
-                    # Remove language identifier if present
-                    if content.startswith("json"):
-                        content = content[4:].strip()
-            
-            # Try to find JSON object in the content
-            if not content.startswith('{'):
-                # Look for JSON object in the text
-                start_idx = content.find('{')
-                end_idx = content.rfind('}')
-                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                    content = content[start_idx:end_idx+1]
-            
-            if not content or not content.strip():
-                logger.warning("No JSON found in AI response, using fallback descriptions")
-                return self._generate_basic_asset_descriptions(game_design)
-            
+        except Exception as e:
+            logger.warning(f"DeepSeek API error in asset description generation: {e}")
+            logger.info("   Falling back to basic asset descriptions (this is OK)")
+            return self._generate_basic_asset_descriptions(game_design)
+        
+        # Extract JSON from markdown code blocks
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            # Try to extract from any code block
+            parts = content.split("```")
+            if len(parts) >= 3:
+                content = parts[1].strip()
+                # Remove language identifier if present
+                if content.startswith("json"):
+                    content = content[4:].strip()
+        
+        # Try to find JSON object in the content
+        if not content.startswith('{'):
+            # Look for JSON object in the text
+            start_idx = content.find('{')
+            end_idx = content.rfind('}')
+            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                content = content[start_idx:end_idx+1]
+        
+        if not content or not content.strip():
+            logger.warning("No JSON found in AI response, using fallback descriptions")
+            return self._generate_basic_asset_descriptions(game_design)
+        
+        # Try to parse JSON
+        try:
             # Repair truncated/incomplete JSON
             content = self._repair_json(content)
             
@@ -420,7 +478,7 @@ Create REFINED, DETAILED descriptions that will produce high-quality assets:"""
                 logger.warning("AI response is not a dictionary, using fallback descriptions")
                 return self._generate_basic_asset_descriptions(game_design)
             
-            logger.info("✅ Successfully parsed AI-generated asset descriptions")
+            logger.info("Successfully parsed AI-generated asset descriptions")
             return descriptions
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse JSON from AI response: {e}")
@@ -433,7 +491,7 @@ Create REFINED, DETAILED descriptions that will produce high-quality assets:"""
                     if repaired and self._is_valid_json(repaired):
                         descriptions = json.loads(repaired)
                         if isinstance(descriptions, dict):
-                            logger.info("✅ Successfully parsed after aggressive repair")
+                            logger.info("Successfully parsed after aggressive repair")
                             return descriptions
             except Exception as repair_error:
                 logger.warning(f"Repair attempt failed: {repair_error}")
@@ -605,56 +663,136 @@ Create REFINED, DETAILED descriptions that will produce high-quality assets:"""
         # This will be enhanced to use the descriptions
         return self._generate_procedural_ui()
     
-    async def _generate_dalle_hero(self, game_design: Dict, player_desc: Dict = None) -> Dict:
-        """Generate custom hero sprite with DALL-E 3 using AI-generated descriptions"""
+    async def _generate_dalle_assets(
+        self, 
+        game_design: Dict, 
+        asset_descriptions: Dict
+    ) -> List[Dict]:
+        """Generate all game assets with DALL-E 3 using AI descriptions"""
         
-        if player_desc:
-            description = player_desc.get('description', game_design.get('player_description', 'hero character'))
-            style_notes = player_desc.get('style_notes', '')
-        else:
-            description = game_design.get('player_description', 'hero character')
-            style_notes = ''
+        assets = []
         
-        prompt = f"""
-        {game_design.get('art_style', 'Pixel art')} video game sprite: {description}
-        {style_notes}
-        Style: {game_design.get('art_style', 'pixel art')}
-        64x64 pixel sprite, transparent background, game-ready, centered, high quality
-        """
+        # Generate each asset type
+        asset_configs = [
+            {
+                'type': 'player',
+                'desc_key': 'player',
+                'size': (128, 128),  # Larger for better quality
+                'prompt_template': "{art_style} video game character sprite: {description}. {style_notes}. {size} pixel sprite, transparent background, game-ready, centered, high quality, detailed textures, professional game art"
+            },
+            {
+                'type': 'enemy',
+                'desc_key': 'enemy',
+                'size': (128, 128),
+                'prompt_template': "{art_style} video game enemy sprite: {description}. {style_notes}. {size} pixel sprite, transparent background, game-ready, centered, high quality, detailed textures, menacing appearance"
+            },
+            {
+                'type': 'collectible',
+                'desc_key': 'collectible',
+                'size': (64, 64),
+                'prompt_template': "{art_style} video game collectible item: {description}. Shiny, attractive, glowing effect. {size} pixel sprite, transparent background, game-ready, centered, high quality, detailed textures"
+            },
+            {
+                'type': 'platform',
+                'desc_key': 'platform',
+                'size': (256, 64),
+                'prompt_template': "{art_style} video game platform texture: {description}. {style_notes}. {size} pixel tile, seamless texture, game-ready, high quality, detailed surface"
+            },
+            {
+                'type': 'background',
+                'desc_key': 'background',
+                'size': (1920, 1080),
+                'prompt_template': "{art_style} video game background: {description}. {style_notes}. {size} pixel background, game-ready, high quality, detailed environment, atmospheric"
+            }
+        ]
+        
+        for config in asset_configs:
+            try:
+                desc = asset_descriptions.get(config['desc_key'], {})
+                if not desc:
+                    continue
+                
+                description = desc.get('description', '')
+                style_notes = desc.get('style_notes', '')
+                art_style = game_design.get('art_style', 'pixel art')
+                
+                prompt = config['prompt_template'].format(
+                    art_style=art_style,
+                    description=description,
+                    style_notes=style_notes,
+                    size=f"{config['size'][0]}x{config['size'][1]}"
+                )
+                
+                # Generate with DALL-E 3 (HD quality)
+                asset = await self._generate_dalle_image(
+                    prompt,
+                    config['type'],
+                    config['size'],
+                    game_design
+                )
+                
+                if asset:
+                    assets.append(asset)
+                    logger.info(f"Generated {config['type']} with DALL-E 3")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to generate {config['type']} with DALL-E: {e}")
+                continue
+        
+        return assets
+    
+    async def _generate_dalle_image(
+        self,
+        prompt: str,
+        asset_type: str,
+        target_size: tuple,
+        game_design: Dict
+    ) -> Optional[Dict]:
+        """Generate a single image with DALL-E 3"""
+        
+        if not self.openai:
+            return None
         
         try:
-            # Call DALL-E 3
+            # Call DALL-E 3 with standard quality (free tier)
+            # Note: Free tier uses "standard" quality, HD requires paid tier
             response = await self.openai.images.generate(
                 model="dall-e-3",
                 prompt=prompt,
-                size="1024x1024",
-                quality="standard"
+                size="1024x1024",  # DALL-E 3 supports 1024x1024, 1792x1024, 1024x1792
+                quality="standard",  # Free tier - standard quality (HD requires paid)
+                n=1
             )
             
             # Download image
             image_url = response.data[0].url
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=60.0) as client:
                 img_data = await client.get(image_url)
                 image_bytes = img_data.content
             
-            # Resize to 64x64
+            # Process image: resize to target size while maintaining quality
             img = Image.open(BytesIO(image_bytes))
-            img = img.resize((64, 64), Image.Resampling.LANCZOS)
-            output = BytesIO()
-            img.save(output, format="PNG")
             
-            logger.info("✅ DALL-E hero generated")
+            # Use high-quality resampling for better results
+            if target_size != (1024, 1024):
+                img = img.resize(target_size, Image.Resampling.LANCZOS)
+            
+            # Save as PNG
+            output = BytesIO()
+            img.save(output, format="PNG", optimize=True)
+            
+            logger.info(f"DALL-E 3 generated {asset_type} ({target_size[0]}x{target_size[1]})")
             
             return {
-                "type": "player",
-                "path": "assets/sprites/player.png",
+                "type": asset_type,
+                "path": f"assets/sprites/{asset_type}.png",
                 "data": output.getvalue(),
-                "source": "dalle3"
+                "source": "dalle3_hd"
             }
             
         except Exception as e:
-            logger.error(f"DALL-E failed: {e}")
-            return self._create_placeholder("player")
+            logger.error(f"DALL-E 3 generation failed for {asset_type}: {e}")
+            return None
     
     def _generate_procedural_ui(self) -> List[Dict]:
         """Generate simple UI elements procedurally (legacy method)"""
@@ -680,8 +818,8 @@ Create REFINED, DETAILED descriptions that will produce high-quality assets:"""
         # For now, we'll use enhanced procedural generation
         # In production, you'd integrate with actual asset store APIs
         
-        logger.info(f"🔍 Searching for free assets: {search_terms}")
-        logger.info("💡 Using enhanced procedural generation (free asset API integration can be added)")
+        logger.info(f"Searching for free assets: {search_terms}")
+        logger.info("Using enhanced procedural generation (free asset API integration can be added)")
         
         return assets
     
@@ -716,27 +854,33 @@ Use terms that would match free assets on OpenGameArt, Kenney.nl, or itch.io:"""
             
             if not content:
                 return self._generate_basic_search_terms(game_design)
-            
-            # Extract JSON from markdown code blocks
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                parts = content.split("```")
-                if len(parts) >= 3:
-                    content = parts[1].strip()
-                    if content.startswith("json"):
-                        content = content[4:].strip()
-            
-            # Try to find JSON object
-            if not content.startswith('{'):
-                start_idx = content.find('{')
-                end_idx = content.rfind('}')
-                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                    content = content[start_idx:end_idx+1]
-            
-            if not content or not content.strip():
-                return self._generate_basic_search_terms(game_design)
-            
+        except Exception as e:
+            logger.warning(f"DeepSeek API error in search term generation: {e}")
+            logger.info("   Falling back to basic search terms (this is OK)")
+            return self._generate_basic_search_terms(game_design)
+        
+        # Extract JSON from markdown code blocks
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            parts = content.split("```")
+            if len(parts) >= 3:
+                content = parts[1].strip()
+                if content.startswith("json"):
+                    content = content[4:].strip()
+        
+        # Try to find JSON object
+        if not content.startswith('{'):
+            start_idx = content.find('{')
+            end_idx = content.rfind('}')
+            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                content = content[start_idx:end_idx+1]
+        
+        if not content or not content.strip():
+            return self._generate_basic_search_terms(game_design)
+        
+        # Try to parse JSON
+        try:
             # Repair truncated/incomplete JSON
             content = self._repair_json(content)
             
@@ -755,7 +899,7 @@ Use terms that would match free assets on OpenGameArt, Kenney.nl, or itch.io:"""
                     if repaired and self._is_valid_json(repaired):
                         result = json.loads(repaired)
                         if isinstance(result, dict):
-                            logger.info("✅ Successfully parsed search terms after aggressive repair")
+                            logger.info("Successfully parsed search terms after aggressive repair")
                             return result
             except Exception as repair_error:
                 logger.warning(f"Search terms repair attempt failed: {repair_error}")
@@ -1050,7 +1194,7 @@ Use terms that would match free assets on OpenGameArt, Kenney.nl, or itch.io:"""
             "source": "fallback"
         })
         
-        logger.info("✅ Generated fallback assets")
+        logger.info("Generated fallback assets")
         return assets
     
     def _create_placeholder(self, name: str) -> Dict:

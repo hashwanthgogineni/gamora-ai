@@ -148,7 +148,7 @@ const Homepage: React.FC = () => {
               className="text-green-500 text-lg md:text-xl"
               style={{ fontFamily: "'Pixelify Sans', sans-serif" }}
             >
-              Gamora
+              Gamora AI
             </span>
           </div>
           <p className="text-gray-400 text-sm font-light">

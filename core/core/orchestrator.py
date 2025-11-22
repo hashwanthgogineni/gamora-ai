@@ -1,71 +1,259 @@
-"""
-Master Orchestrator
-Coordinates all AI agents and the Godot build pipeline
-"""
-
 import asyncio
 from typing import Dict, Any, Optional, List
 import logging
 from datetime import datetime
 import hashlib
 import json
+import re
 
-from models.chatgpt_client import ChatGPTClient
 from models.deepseek_client import DeepSeekClient
 from agents.asset_manager import AssetManagerAgent
 
 logger = logging.getLogger(__name__)
 
 
+def _repair_json(content: str) -> str:
+    if not content:
+        return "{}"
+    content = content.strip()
+    open_braces = content.count('{')
+    close_braces = content.count('}')
+    if open_braces > close_braces:
+        content += '}' * (open_braces - close_braces)
+    content = re.sub(r',\s*}', '}', content)
+    content = re.sub(r',\s*]', ']', content)
+    return content
+
+
+def _parse_ai_json_response(content: str, fallback: Dict = None) -> Dict:
+    if not content:
+        return fallback or {}
+    
+    if "```json" in content:
+        content = content.split("```json")[1].split("```")[0].strip()
+    elif "```" in content:
+        parts = content.split("```")
+        if len(parts) >= 3:
+            content = parts[1].strip()
+            if content.startswith("json"):
+                content = content[4:].strip()
+    
+    if not content.startswith('{'):
+        start_idx = content.find('{')
+        end_idx = content.rfind('}')
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            content = content[start_idx:end_idx+1]
+    
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        content = _repair_json(content)
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            logger.warning("JSON parse failed, using fallback")
+            return fallback or {}
+
+
+async def _ai_retry_with_self_correction(
+    deepseek_client,
+    initial_messages: List[Dict],
+    parse_function,
+    max_retries: int = 3,  # 3 retries - no fallbacks
+    task_name: str = "AI generation"
+) -> Any:
+    last_error = None
+    last_response = None
+    improved_messages = initial_messages.copy()
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"{task_name} - Attempt {attempt + 1}/{max_retries}")
+            
+            # Optimized for quality: lower temperature = more consistent, higher quality
+            response = await deepseek_client.generate(
+                improved_messages, 
+                temperature=0.15 if attempt == 0 else 0.3,
+                max_tokens=5000
+            )
+            
+            content = response.get('content', '')
+            last_response = content
+            
+            if not content or not content.strip():
+                raise ValueError("Empty response from AI")
+            
+            result = parse_function(content)
+            
+            if result is not None:
+                logger.info(f"{task_name} succeeded on attempt {attempt + 1}")
+                return result
+            else:
+                raise ValueError("Parse function returned None")
+                
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError, AttributeError) as e:
+            last_error = e
+            logger.warning(f"{task_name} attempt {attempt + 1} failed: {e}")
+            
+            if attempt == max_retries - 1:
+                logger.error(f"{task_name} failed after {max_retries} attempts - skipping this step")
+                logger.error(f"   Last error: {last_error}")
+                logger.error(f"   No further AI calls will be made for this generation")
+                # Immediately raise to stop all further processing and save tokens
+                raise ValueError(f"{task_name} failed after {max_retries} attempts. Process terminated to prevent token waste.")
+            
+            logger.info(f"Using AI to analyze error and improve prompt...")
+            try:
+                error_analysis_messages = [
+                    {
+                        "role": "system",
+                        "content": "You are an expert at analyzing AI generation errors and improving prompts. Your job is to help fix generation issues by understanding what went wrong and suggesting better prompts."
+                    },
+                    {
+                        "role": "user",
+                        "content": f"""I'm trying to generate {task_name}, but it's failing. Help me fix this.
+
+Original Prompt:
+{json.dumps(initial_messages, indent=2)}
+
+Error that occurred:
+{str(e)}
+
+AI Response (that failed to parse):
+{last_response[:500] if last_response else 'No response'}
+
+Attempt number: {attempt + 1}
+
+Please analyze what went wrong and provide an improved prompt that will:
+1. Be more explicit about the required JSON format
+2. Include clear examples if needed
+3. Address the specific error that occurred
+4. Ensure the response will be valid JSON
+
+Return a JSON object with:
+{{
+  "analysis": "What went wrong and why",
+  "improved_prompt": "The improved user message content",
+  "suggestions": ["suggestion1", "suggestion2"]
+}}"""
+                    }
+                ]
+                
+                analysis_response = await deepseek_client.generate(
+                    error_analysis_messages,
+                    temperature=0.4,
+                    max_tokens=2000
+                )
+                
+                analysis_content = analysis_response.get('content', '')
+                
+                # Extract improved prompt from analysis
+                if "```json" in analysis_content:
+                    analysis_json = analysis_content.split("```json")[1].split("```")[0].strip()
+                elif "```" in analysis_content:
+                    parts = analysis_content.split("```")
+                    if len(parts) >= 3:
+                        analysis_json = parts[1].strip()
+                        if analysis_json.startswith("json"):
+                            analysis_json = analysis_json[4:].strip()
+                else:
+                    # Try to find JSON in the response
+                    start_idx = analysis_content.find('{')
+                    end_idx = analysis_content.rfind('}')
+                    if start_idx != -1 and end_idx != -1:
+                        analysis_json = analysis_content[start_idx:end_idx+1]
+                    else:
+                        analysis_json = None
+                
+                if analysis_json:
+                    try:
+                        analysis = json.loads(analysis_json)
+                        improved_prompt = analysis.get('improved_prompt', '')
+                        analysis_text = analysis.get('analysis', '')
+                        
+                        if improved_prompt:
+                            logger.info(f"AI Analysis: {analysis_text[:200]}")
+                            # Update the user message with improved prompt
+                            if improved_messages and len(improved_messages) > 0 and isinstance(improved_messages[-1], dict):
+                                improved_messages[-1]['content'] = improved_prompt
+                            logger.info(f"Retrying with improved prompt...")
+                        else:
+                            # If no improved prompt, add error context to original
+                            if improved_messages and len(improved_messages) > 0 and isinstance(improved_messages[-1], dict):
+                                improved_messages[-1]['content'] = f"""{improved_messages[-1].get('content', '')}
+
+IMPORTANT: The previous attempt failed with error: {str(e)}
+Please ensure your response is valid JSON. Return ONLY a JSON object, no other text.
+Make sure all strings are properly quoted and all brackets are balanced."""
+                            logger.info(f"Retrying with error context added...")
+                    except json.JSONDecodeError:
+                        # If analysis itself fails, just add error context
+                        if improved_messages and len(improved_messages) > 0 and isinstance(improved_messages[-1], dict):
+                            improved_messages[-1]['content'] = f"""{improved_messages[-1].get('content', '')}
+
+IMPORTANT: The previous attempt failed with error: {str(e)}
+Please ensure your response is valid JSON. Return ONLY a JSON object, no other text.
+Make sure all strings are properly quoted and all brackets are balanced."""
+                        logger.info(f"🔄 Retrying with error context added...")
+                else:
+                    # If analysis failed, add error context to original prompt
+                    if improved_messages and len(improved_messages) > 0 and isinstance(improved_messages[-1], dict):
+                        improved_messages[-1]['content'] = f"""{improved_messages[-1].get('content', '')}
+
+IMPORTANT: The previous attempt failed with error: {str(e)}
+Please ensure your response is valid JSON. Return ONLY a JSON object, no other text.
+Make sure all strings are properly quoted and all brackets are balanced."""
+                    logger.info(f"🔄 Retrying with error context added...")
+                    
+            except Exception as analysis_error:
+                logger.warning(f"Error analysis failed: {analysis_error}, adding simple error context")
+                # Fallback: just add error context
+                if improved_messages and len(improved_messages) > 0 and isinstance(improved_messages[-1], dict):
+                    improved_messages[-1]['content'] = f"""{improved_messages[-1].get('content', '')}
+
+IMPORTANT: The previous attempt failed with error: {str(e)}
+Please ensure your response is valid JSON. Return ONLY a JSON object, no other text.
+Make sure all strings are properly quoted and all brackets are balanced."""
+    
+    # Should never reach here, but just in case
+    raise ValueError(f"{task_name} failed after {max_retries} attempts: {last_error}")
+
+
 class MasterOrchestrator:
-    """
-    Orchestrates the complete game generation pipeline using DeepSeek R1:
-    1. Analyze user prompt (DeepSeek R1)
-    2. Generate game design (DeepSeek R1)
-    3. Generate code/logic (DeepSeek R1)
-    4. Generate assets (DALL-E + procedural)
-    5. Build with Godot
-    6. Upload to storage
-    
-    Cost optimization: Uses only DeepSeek R1 for all text/code generation
-    """
-    
+    # Orchestrates game generation pipeline
     def __init__(
         self,
-        openai_api_key: str,
         deepseek_api_key: str,
         cache_manager,
-        godot_service,
         storage_service,
-        ws_manager=None
+        ws_manager=None,
+        web_game_service=None,
+        enable_ai_assets: bool = False  # DALL-E disabled - using DeepSeek for descriptions only
     ):
-        # AI Clients - Primary: DeepSeek R1 (cost-effective)
-        # ChatGPT kept for asset generation (DALL-E) only
-        self.chatgpt = ChatGPTClient(openai_api_key)
         self.deepseek = DeepSeekClient(deepseek_api_key)
-        
-        # Services
         self.cache = cache_manager
-        self.godot = godot_service
+        self.web_game = web_game_service
         self.storage = storage_service
-        self.ws_manager = ws_manager  # WebSocket manager for real-time updates
+        self.ws_manager = ws_manager
+        self.enable_ai_assets = enable_ai_assets
         
-        # Agents
-        self.asset_manager = AssetManagerAgent(self.chatgpt, storage_service)
+        self.asset_manager = AssetManagerAgent(
+            self.deepseek, 
+            storage_service, 
+            enable_ai_assets=enable_ai_assets
+        )
         
-        logger.info("🤖 Master Orchestrator initialized")
+        self.use_template_system = False
+        
+        logger.info("Master Orchestrator initialized")
     
     async def initialize(self):
-        """Initialize all components"""
         logger.info("🚀 Initializing orchestrator...")
-        # Any initialization needed
-        logger.info("✅ Orchestrator ready")
+        logger.info("Orchestrator ready")
     
     async def shutdown(self):
-        """Cleanup"""
-        await self.chatgpt.close()
         await self.deepseek.close()
-        logger.info("🛑 Orchestrator shutdown")
+        logger.info("Orchestrator shutdown")
     
     async def generate_game(
         self,
@@ -74,151 +262,85 @@ class MasterOrchestrator:
         user_tier: str = "free",
         db_manager = None
     ) -> Dict[str, Any]:
-        """
-        Main game generation pipeline
-        
-        Args:
-            project_id: Unique project identifier
-            user_prompt: User's game description
-            user_tier: User tier (free/premium)
-            db_manager: Database manager instance
-        
-        Returns:
-            Complete game data with build URLs
-        """
-        logger.info(f"🎮 Starting game generation for: {project_id}")
+        logger.info(f"Starting game generation for: {project_id}")
         
         start_time = datetime.utcnow()
         
         try:
-            # Update status
-            await self._update_status(project_id, "analyzing", "Analyzing your idea...")
+            # Simplified: Let AI generate the complete game directly from user prompt
+            # No intermediate phases - AI decides everything in its own style
+            await self._update_status(project_id, "generating", "AI is creating your complete game...")
+            logger.info("Generating complete HTML5 game with DeepSeek - AI decides everything")
             
-            # Step 1: Analyze intent and extract game concept (with fallback)
-            try:
-            game_concept = await self._analyze_intent(user_prompt)
-                if not game_concept or not isinstance(game_concept, dict):
-                    raise ValueError("Invalid concept returned")
-            except Exception as e:
-                logger.warning(f"Intent analysis failed, using fallback: {e}")
-                game_concept = self._create_fallback_concept(user_prompt)
-            await self._log_step(db_manager, project_id, "intent_analysis", "success", 
-                               ai_model="deepseek-reasoner", metadata=game_concept)
+            # Generate complete game directly from user prompt
+            # AI will decide: mechanics, levels, style, everything
+            if not self.web_game:
+                raise ValueError("Web game service is required")
             
-            # Step 2: Generate comprehensive game design (with fallback)
-            await self._update_status(project_id, "designing", "Designing your game...")
-            try:
-            game_design = await self._generate_game_design(game_concept, user_prompt)
-                if not game_design or not isinstance(game_design, dict):  
-                    raise ValueError("Invalid design returned")
-                # Merge with concept to ensure we have all fields
-                game_design = {**game_concept, **game_design}
-            except Exception as e:
-                logger.warning(f"Game design generation failed, using fallback: {e}")
-                game_design = self._create_fallback_design(game_concept, user_prompt)
-            await self._log_step(db_manager, project_id, "game_design", "success",
-                               ai_model="deepseek-reasoner", metadata=game_design)
+            # Detect dimension from user prompt
+            from utils.dimension_detector import DimensionDetector
+            detected_dimension = DimensionDetector.detect_dimension(user_prompt)
+            logger.info(f"Detected dimension: {detected_dimension}")
             
-            # Step 3: Generate game mechanics and rules (with fallback)
-            await self._update_status(project_id, "mechanics", "Creating game mechanics...")
-            try:
-            game_mechanics = await self._generate_game_mechanics(game_design)
-                if not game_mechanics or not isinstance(game_mechanics, dict):
-                    raise ValueError("Invalid mechanics returned")
-            except Exception as e:
-                logger.warning(f"Mechanics generation failed, using fallback: {e}")
-                game_mechanics = self._create_fallback_mechanics(game_design)
-            await self._log_step(db_manager, project_id, "game_mechanics", "success",
-                               ai_model="deepseek-reasoner", metadata=game_mechanics)
-            
-            # Step 4: Generate GDScript code
-            # Note: Actual scripts are generated by GodotService using GDScriptGenerator
-            # This step just validates/prepares the structure
-            await self._update_status(project_id, "coding", "Writing game code...")
-            # This should never fail - _generate_game_code always returns a valid dict
-            game_scripts = await self._generate_game_code(game_design, game_mechanics)
-            # Validate it's a dict (should always be true)
-            if not isinstance(game_scripts, dict):
-                logger.error("CRITICAL: _generate_game_code returned non-dict, this should never happen!")
-                game_scripts = {"scripts_generated_by": "godot_service", "custom_scripts": {}}
-            await self._log_step(db_manager, project_id, "code_generation", "success",
-                               ai_model="deepseek-reasoner")
-            
-            # Step 5: Generate game assets (with fallback)
-            await self._update_status(project_id, "assets", "Creating game assets...")
-            try:
-                game_assets = await self.asset_manager.generate_assets(game_design, user_tier, self.deepseek)
-                if not game_assets or not isinstance(game_assets, list):
-                    raise ValueError("Invalid assets returned")
-            except Exception as e:
-                logger.warning(f"Asset generation failed, using fallback: {e}")
-                game_assets = self.asset_manager._generate_fallback_assets(game_design)
-            await self._log_step(db_manager, project_id, "asset_generation", "success",
-                               ai_model="dall-e-3" if user_tier == "premium" else "procedural")
-            
-            # Step 6: Generate UI design (with fallback)
-            await self._update_status(project_id, "ui", "Designing user interface...")
-            try:
-            ui_design = await self._generate_ui_design(game_design)
-                if not ui_design or not isinstance(ui_design, dict):
-                    raise ValueError("Invalid UI design returned")
-            except Exception as e:
-                logger.warning(f"UI design generation failed, using fallback: {e}")
-                ui_design = self._create_fallback_ui_design(game_design)
-            await self._log_step(db_manager, project_id, "ui_design", "success",
-                               ai_model="deepseek-reasoner")
-            
-            # Step 7: Generate level design (with fallback)
-            await self._update_status(project_id, "levels", "Building game levels...")
-            try:
-            level_design = await self._generate_level_design(game_design, game_mechanics)
-                if not level_design or not isinstance(level_design, dict):
-                    raise ValueError("Invalid level design returned")
-            except Exception as e:
-                logger.warning(f"Level design generation failed, using fallback: {e}")
-                level_design = self._create_fallback_level_design(game_design)
-            await self._log_step(db_manager, project_id, "level_design", "success",
-                               ai_model="deepseek-reasoner")
-            
-            # Compile all AI-generated content
-            ai_content = {
-                "game_design": game_design,
-                "game_mechanics": game_mechanics,
-                "scripts": game_scripts,
-                "assets": game_assets,
-                "ui_design": ui_design,
-                "level_design": level_design
+            # Create minimal structure for AI to work with
+            # AI will generate everything based on the prompt
+            minimal_design = {
+                "title": user_prompt[:50] if user_prompt else "AI Generated Game",
+                "description": user_prompt,
+                "genre": "platformer",  # Default, AI can change
+                "dimension": detected_dimension  # Use detected dimension
             }
             
-            # Step 8: Build with Godot Engine
-            if not self.godot:
-                await self._update_status(project_id, "building", "Godot not available - skipping build...")
-                build_result = {
-                    "success": False,
-                    "error": "Godot Engine not installed. Please install Godot and set GODOT_PATH in .env",
-                    "builds": {},
-                    "web_preview_url": None
-                }
-            else:
-            await self._update_status(project_id, "building", "Building your game with Godot...")
-            build_result = await self.godot.build_game_from_ai_content(
-                project_id,
-                ai_content,
+            minimal_mechanics = {
+                "player_movement": {"speed": 300.0, "jump_force": -400.0},
+                "physics": {"gravity": 0.8}
+            }
+            
+            # Let AI generate the complete game in one go
+            await self._update_status(project_id, "building", "AI is building your complete HTML5 game...")
+            logger.info("AI generating complete HTML5 game from scratch...")
+            
+            build_result = await self.web_game.build_game_from_ai_content(
+                    project_id,
+                {
+                    "game_design": minimal_design,
+                    "game_mechanics": minimal_mechanics,
+                    "scripts": {"scripts_generated_by": "ai_deepseek", "use_ai": True},
+                    "assets": [],
+                    "ui_design": {},
+                    "level_design": {},
+                    "user_prompt": user_prompt  # Pass original prompt for AI to use
+                },
                     self.storage,
-                    self.deepseek  # Pass DeepSeek client for AI code generation
-            )
+                        self.deepseek
+                    )
+            
+            # Create ai_content from what was generated
+            ai_content = {
+                "game_design": minimal_design,
+                "game_mechanics": minimal_mechanics,
+                "scripts": {"scripts_generated_by": "ai_deepseek", "use_ai": True},
+                "assets": [],
+                "ui_design": {},
+                "level_design": {},
+                "user_prompt": user_prompt
+            }
+            
+            await self._log_step(db_manager, project_id, "game_generation", "success",
+                               ai_model="deepseek-chat", metadata={"method": "direct_ai_generation"})
             
             if not build_result.get('success'):
-                logger.warning(f"⚠️  Game build failed or skipped: {build_result.get('error')}")
+                logger.warning(f"Game build failed or skipped: {build_result.get('error')}")
                 # Continue anyway - AI content is still saved
             
-            await self._log_step(db_manager, project_id, "godot_build", "success",
+            build_type = "web_game"
+            await self._log_step(db_manager, project_id, build_type, "success",
                                metadata=build_result)
             
             # Step 9: Validate game content before saving
             validation_errors = await self._validate_game_content(ai_content, build_result)
             if validation_errors:
-                logger.warning(f"⚠️  Validation warnings for {project_id}: {validation_errors}")
+                logger.warning(f"Validation warnings for {project_id}: {validation_errors}")
                 # Continue anyway, but log warnings
             
             # Step 10: Save to database
@@ -231,12 +353,13 @@ class MasterOrchestrator:
                 )
                 
                 # Save build information
+                preview_url = build_result.get('preview_url') or build_result.get('web_preview_url')
                 for platform, url in build_result.get('builds', {}).items():
                     await db_manager.create_build(
                         project_id,
                         platform,
                         url,
-                        web_preview_url=build_result.get('web_preview_url'),
+                        web_preview_url=preview_url,
                         status="completed"
                     )
             
@@ -244,88 +367,35 @@ class MasterOrchestrator:
             await self._update_status(project_id, "completed", "Your game is ready!")
             
             duration = (datetime.utcnow() - start_time).total_seconds()
-            logger.info(f"✅ Game generated successfully in {duration:.2f}s: {project_id}")
+            logger.info(f"Game generated successfully in {duration:.2f}s: {project_id}")
             
+            preview_url = build_result.get('preview_url') or build_result.get('web_preview_url')
             return {
                 "success": True,
                 "project_id": project_id,
                 "ai_content": ai_content,
                 "builds": build_result.get('builds', {}),
-                "web_preview_url": build_result.get('web_preview_url'),
+                "web_preview_url": preview_url,
+                "preview_url": preview_url,
                 "duration_seconds": duration,
                 "timestamp": datetime.utcnow().isoformat(),
                 "validation_warnings": validation_errors if validation_errors else []
             }
             
         except Exception as e:
-            logger.error(f"❌ Game generation failed for {project_id}: {e}", exc_info=True)
-            
-            # Try to generate a minimal working game even on failure
-            try:
-                logger.info("🔄 Attempting to generate minimal fallback game...")
-                await self._update_status(project_id, "recovering", "Recovering from error, generating basic game...")
-                
-                # Create minimal fallback content
-                fallback_concept = self._create_fallback_concept(user_prompt)
-                fallback_design = self._create_fallback_design(fallback_concept, user_prompt)
-                fallback_mechanics = self._create_fallback_mechanics(fallback_design)
-                fallback_scripts = self._create_fallback_scripts(fallback_design, fallback_mechanics)
-                fallback_assets = self.asset_manager._generate_fallback_assets(fallback_design)
-                fallback_ui = self._create_fallback_ui_design(fallback_design)
-                fallback_levels = self._create_fallback_level_design(fallback_design)
-                
-                ai_content = {
-                    "game_design": fallback_design,
-                    "game_mechanics": fallback_mechanics,
-                    "scripts": fallback_scripts,
-                    "assets": fallback_assets,
-                    "ui_design": fallback_ui,
-                    "level_design": fallback_levels
-                }
-                
-                # Try to build even with fallback content
-                build_result = {"success": False, "builds": {}, "web_preview_url": None, "error": "Fallback mode"}
-                if self.godot:
-                    try:
-                        build_result = await self.godot.build_game_from_ai_content(
-                            project_id, ai_content, self.storage, self.deepseek
-                        )
-                    except Exception as build_error:
-                        logger.warning(f"Fallback build also failed: {build_error}")
-                
-                # Save fallback content
-                if db_manager:
-                    await db_manager.update_project(
-                        project_id,
-                        status="completed",
-                        ai_content=ai_content,
-                        completed_at=datetime.utcnow()
-                    )
-                
-                await self._update_status(project_id, "completed", "Generated basic game (recovery mode)")
-                
-                duration = (datetime.utcnow() - start_time).total_seconds()
-                logger.info(f"✅ Fallback game generated in {duration:.2f}s: {project_id}")
-                
-                return {
-                    "success": True,
-                    "project_id": project_id,
-                    "ai_content": ai_content,
-                    "builds": build_result.get('builds', {}),
-                    "web_preview_url": build_result.get('web_preview_url'),
-                    "duration_seconds": duration,
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "recovery_mode": True,
-                    "original_error": str(e)
-                }
-                
-            except Exception as recovery_error:
-                logger.error(f"❌ Recovery also failed: {recovery_error}", exc_info=True)
-            await self._update_status(project_id, "failed", f"Generation failed: {str(e)}")
-            
+            # Log the error and fail
+            error_msg = str(e)
+            logger.error(f"Game generation failed for {project_id}: {error_msg}")
+            await self._update_status(project_id, "failed", f"Generation failed: {error_msg}")
             if db_manager:
                 await db_manager.update_project(project_id, status="failed")
-                await self._log_step(db_manager, project_id, "generation", "failed", error=str(e))
+                await self._log_step(db_manager, project_id, "generation", "failed", error=error_msg)
+            return {
+                "success": False,
+                "project_id": project_id,
+                "error": error_msg,
+                "timestamp": datetime.utcnow().isoformat()
+            }
             
             return {
                 "success": False,
@@ -335,266 +405,495 @@ class MasterOrchestrator:
             }
     
     async def _analyze_intent(self, user_prompt: str) -> Dict:
-        """Step 1: Analyze user intent and extract game concept - Using DeepSeek R1"""
+        """Step 1: Analyze user intent - DISABLED: AI not used, fallback only"""
+        # TEMPLATE-ONLY MODE: Skip AI, use fallback
+        logger.info("TEMPLATE-ONLY MODE: Skipping AI intent analysis, using fallback")
+        concept = self._create_fallback_concept(user_prompt)
         
-        # Game reference knowledge for popular games
-        game_references = """
-Popular Game References:
-- Subway Surfers: Endless runner, swipe controls (left/right/up/down), collect coins, avoid obstacles, colorful 3D style, fast-paced
-- Temple Run: Endless runner, tilt/swipe controls, collect coins, power-ups, jungle theme, dynamic camera
-- Flappy Bird: Simple tap-to-jump, avoid pipes, pixel art, high score challenge
-- Candy Crush: Match-3 puzzle, colorful candies, level-based progression, power-ups
-- Angry Birds: Physics-based slingshot, destroy structures, colorful cartoon style
-- Super Mario: Platformer, jump and run, collect coins, defeat enemies, power-ups (mushroom, fire flower)
-- Sonic: Fast platformer, speed-based, collect rings, loop-de-loops, colorful
-- Pac-Man: Maze game, collect dots, avoid ghosts, power pellets
-- Tetris: Falling blocks puzzle, line clearing, increasing speed
-- Crossy Road: Endless hopper, tap to move forward, avoid traffic, pixel art style
-"""
-        
-        messages = [
-            {
-                "role": "user",
-                "content": f"""You are a game design expert with deep knowledge of popular games. Analyze the user's game idea and extract key concepts.
-
-{game_references}
-
-User's game request: {user_prompt}
-
-IMPORTANT: If the user references a popular game (like "like Subway Surfers", "similar to Temple Run", "inspired by Flappy Bird"), extract the core mechanics, visual style, and gameplay feel of that game.
-
-Return a JSON object with:
-- genre: Game genre (platformer, puzzle, rpg, shooter, endless_runner, etc.)
-- dimension: "2D" or "3D" - CRITICAL RULES:
-  * If user mentions "2D", "2d", "two dimensional", "pixel art", "side-scrolling", set to "2D"
-  * If user mentions "3D", "3d", "three dimensional", or references 3D games like Subway Surfers, set to "3D"
-  * If user mentions "4D", "4d", "5D", "5d", or any higher dimension, convert to "3D" (we only support 2D and 3D)
-  * Default to "2D" if unclear
-- theme: Visual/story theme
-- target_audience: Who is this for
-- core_mechanic: Main gameplay mechanic (be specific - e.g., "endless running with swipe controls" not just "running")
-- referenced_game: Name of popular game if mentioned (null if none)
-- game_style: Visual style to match (e.g., "colorful 3D like Subway Surfers", "pixel art like Flappy Bird")
-- difficulty: easy, medium, hard
-- estimated_scope: small (this is a starter/kickoff game, not full scale)
-- key_features: List of 3-5 key features that make this game unique or match the referenced game"""
-            }
-        ]
-        
-        response = await self.deepseek.generate(messages, temperature=0.5)
-        
-        try:
-            # Parse JSON from response
-            content = response['content']
-            # Extract JSON from markdown if present
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-            
-            concept = json.loads(content)
-            
-            # Normalize dimension: Convert 4D/5D to 3D, ensure 2D/3D only
-            dimension = concept.get('dimension', '2D')
-            if isinstance(dimension, str):
-                dimension_upper = dimension.upper()
-                if '4D' in dimension_upper or '5D' in dimension_upper or dimension_upper in ['4', '5', '6', '7', '8', '9']:
-                    logger.info(f"Converting {dimension} to 3D (only 2D and 3D supported)")
-                    concept['dimension'] = '3D'
-                elif dimension_upper in ['2D', '2']:
-                    concept['dimension'] = '2D'
-                elif dimension_upper in ['3D', '3']:
-                    concept['dimension'] = '3D'
-                else:
-                    # Default to 2D if unclear
-                    concept['dimension'] = '2D'
+        # Normalize dimension: Convert 4D/5D to 3D, ensure 2D/3D only
+        dimension = concept.get('dimension', '2D')
+        if isinstance(dimension, str):
+            dimension_upper = dimension.upper()
+            if '4D' in dimension_upper or '5D' in dimension_upper or dimension_upper in ['4', '5', '6', '7', '8', '9']:
+                logger.info(f"Converting {dimension} to 3D (only 2D and 3D supported)")
+                concept['dimension'] = '3D'
+            elif dimension_upper in ['2D', '2']:
+                concept['dimension'] = '2D'
+            elif dimension_upper in ['3D', '3']:
+                concept['dimension'] = '3D'
             else:
                 concept['dimension'] = '2D'
-            
-            # Ensure scope is small (starter game)
-            concept['estimated_scope'] = 'small'
-            
-            return concept
-        except Exception as e:
-            logger.warning(f"Intent analysis error: {e}, using fallback")
-            return self._create_fallback_concept(user_prompt)
+        else:
+            concept['dimension'] = '2D'
+        
+        # Normalize and validate genre - ensure it matches available templates
+        genre = concept.get('genre', 'platformer')
+        if not genre or genre.strip() == '':
+            logger.warning("Genre was empty, defaulting to platformer")
+            genre = 'platformer'
+        
+        # Normalize genre using genre registry (handles variations)
+        from services.genre_registry import GenreRegistry
+        genre_registry = GenreRegistry()
+        normalized_genre = genre_registry.normalize_genre(genre)
+        
+        # Validate genre is one we have templates for
+        valid_genres = [
+            'platformer', 'puzzle', 'rpg', 'shooter', 'endless_runner', 
+            'match_3', 'tower_defense', 'racing', 'farming_sim', 
+            'roguelike', 'metroidvania', 'survival', 'rhythm', 'bullet_hell'
+        ]
+        
+        if normalized_genre not in valid_genres:
+            logger.warning(f"Genre '{normalized_genre}' not in valid templates, defaulting to platformer")
+            normalized_genre = 'platformer'
+        
+        concept['genre'] = normalized_genre
+        concept['estimated_scope'] = 'small'
+        
+        logger.info(f"Intent analysis complete (fallback): genre={normalized_genre}, dimension={concept['dimension']}")
+        
+        return concept
     
     def _create_fallback_concept(self, user_prompt: str) -> Dict:
-        """Create a fallback game concept from user prompt"""
+        """Create a fallback game concept from user prompt - optimized for basic prompts"""
         prompt_lower = user_prompt.lower()
         
-        # Detect dimension
-        dimension = "2D"
+        # Detect dimension - prioritize explicit mentions
+        dimension = "2D"  # Default to 2D for basic prompts
         if any(word in prompt_lower for word in ["3d", "3-d", "three dimensional", "subway", "temple run"]):
             dimension = "3D"
         elif any(word in prompt_lower for word in ["2d", "2-d", "two dimensional", "pixel", "side-scrolling"]):
             dimension = "2D"
         
-        # Detect genre
-        genre = "platformer"
-        if "runner" in prompt_lower:
+        # Detect genre - use platformer as universal default for basic prompts
+        genre = "platformer"  # Universal default for "create a game" type prompts
+        if "runner" in prompt_lower or "endless" in prompt_lower:
             genre = "endless_runner"
         elif "puzzle" in prompt_lower:
             genre = "puzzle"
-        elif "shooter" in prompt_lower or "shoot" in prompt_lower:
+        elif "shooter" in prompt_lower or "shoot" in prompt_lower or "fps" in prompt_lower:
             genre = "shooter"
+        elif "rpg" in prompt_lower or "role playing" in prompt_lower:
+            genre = "rpg"
+        elif "match" in prompt_lower and "3" in prompt_lower:
+            genre = "match_3"
+        elif "tower" in prompt_lower and "defense" in prompt_lower:
+            genre = "tower_defense"
+        elif "racing" in prompt_lower or "race" in prompt_lower:
+            genre = "racing"
+        elif "farming" in prompt_lower or "farm" in prompt_lower:
+            genre = "farming_sim"
+        elif "rogue" in prompt_lower:
+            genre = "roguelike"
+        elif "metroidvania" in prompt_lower:
+            genre = "metroidvania"
+        elif "survival" in prompt_lower:
+            genre = "survival"
+        elif "rhythm" in prompt_lower:
+            genre = "rhythm"
+        elif "bullet" in prompt_lower and "hell" in prompt_lower:
+            genre = "bullet_hell"
         
-            return {
+        # Determine core mechanic based on genre
+        core_mechanic_map = {
+            "platformer": "jump and collect",
+            "endless_runner": "run and avoid obstacles",
+            "puzzle": "solve puzzles",
+            "shooter": "shoot enemies",
+            "rpg": "explore and level up",
+            "match_3": "match three or more",
+            "tower_defense": "place towers and defend",
+            "racing": "race to finish",
+            "farming_sim": "plant and harvest",
+            "roguelike": "explore procedurally generated dungeons",
+            "metroidvania": "explore and unlock abilities",
+            "survival": "gather resources and survive",
+            "rhythm": "tap to the beat",
+            "bullet_hell": "dodge bullets and shoot"
+        }
+        
+        return {
             "genre": genre,
             "dimension": dimension,
-                "theme": "adventure",
-                "target_audience": "casual gamers",
-            "core_mechanic": "jump and collect" if genre == "platformer" else "run and avoid",
-                "difficulty": "medium",
+            "theme": "adventure",
+            "target_audience": "casual gamers",
+            "core_mechanic": core_mechanic_map.get(genre, "jump and collect"),
+            "difficulty": "medium",
             "estimated_scope": "small",
             "referenced_game": None,
             "game_style": "colorful and fun",
             "key_features": ["smooth controls", "collectibles", "progressive difficulty"]
+        }
+    
+    async def _analyze_intent_with_ai(self, user_prompt: str) -> Dict:
+        """Analyze user intent with DeepSeek AI - with self-correcting retry"""
+        messages = [
+            {
+                "role": "user",
+                "content": f"""Analyze this game request and extract key information:
+
+User Request: "{user_prompt}"
+
+Extract and return JSON with:
+{{
+  "genre": "platformer|puzzle|shooter|rpg|etc",
+  "dimension": "2D|3D",
+  "theme": "adventure|sci-fi|fantasy|etc",
+  "target_audience": "casual|hardcore|kids|etc",
+  "core_mechanic": "brief description",
+  "difficulty": "easy|medium|hard",
+  "estimated_scope": "small|medium|large",
+  "referenced_game": "game name if mentioned",
+  "game_style": "description",
+  "key_features": ["feature1", "feature2"]
+}}
+
+IMPORTANT: Return ONLY valid JSON. No markdown, no explanations, just the JSON object."""
             }
+        ]
+        
+        def parse_intent(content: str) -> Dict:
+            """Parse intent analysis response"""
+            if not content:
+                return None
+            
+            # Extract JSON from markdown code blocks
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                parts = content.split("```")
+                if len(parts) >= 3:
+                    content = parts[1].strip()
+                    if content.startswith("json"):
+                        content = content[4:].strip()
+            
+            if not content.startswith('{'):
+                start_idx = content.find('{')
+                end_idx = content.rfind('}')
+                if start_idx != -1 and end_idx != -1:
+                    content = content[start_idx:end_idx+1]
+            
+            try:
+                concept = json.loads(content)
+                # Validate it's a dict
+                if not isinstance(concept, dict):
+                    return None
+                # Normalize dimension
+                dimension = concept.get('dimension', '2D').upper()
+                if dimension not in ['2D', '3D']:
+                    concept['dimension'] = '2D'
+                else:
+                    concept['dimension'] = dimension
+                logger.info(f"AI intent analysis: genre={concept.get('genre')}, dimension={concept.get('dimension')}")
+                return concept
+            except (json.JSONDecodeError, ValueError, TypeError, KeyError) as e:
+                logger.debug(f"Parse error in intent: {e}")
+                return None
+        
+        # Use retry mechanism with self-correction - 3 retries, no fallbacks
+        concept = await _ai_retry_with_self_correction(
+            self.deepseek,
+            messages,
+            parse_intent,
+            max_retries=3,
+            task_name="Intent Analysis"
+        )
+        
+        return concept
+    
+    async def _generate_game_design_with_ai(self, concept: Dict, prompt: str) -> Dict:
+        """Generate detailed game design with DeepSeek AI - enhanced for quality"""
+        messages = [
+            {
+                "role": "system",
+                "content": "You are an expert game designer. Create detailed, creative, and polished game designs that are engaging and well-thought-out."
+            },
+            {
+                "role": "user",
+                "content": f"""Create a COMPLETE, POLISHED game design based on this concept:
+
+CONCEPT:
+{json.dumps(concept, indent=2)}
+
+USER REQUEST: "{prompt}"
+
+GAME DESIGN REQUIREMENTS:
+
+1. TITLE & DESCRIPTION:
+   - Title: Creative, memorable, matches genre
+   - Description: 2-3 sentences explaining the game clearly
+
+2. CORE DESIGN ELEMENTS:
+   {{
+     "title": "Creative Game Title",
+     "description": "Clear 2-3 sentence description of what the game is",
+  "genre": "{concept.get('genre')}",
+  "dimension": "{concept.get('dimension')}",
+     "art_style": "Detailed description (e.g., 'vibrant pixel art with smooth animations' or 'low-poly 3D with cel shading')",
+     "color_scheme": {{
+       "primary": "#hex (main UI/player color)",
+       "secondary": "#hex (accent color)",
+       "background": "#hex (background color)",
+       "accent": "#hex (highlights/effects)"
+     }},
+     "player_description": "Detailed description of player character, abilities, appearance",
+     "enemy_description": "Types of enemies, their behavior, appearance",
+     "environment_description": "World setting, atmosphere, visual style",
+     "win_condition": "Clear win condition (e.g., 'Reach the end of level', 'Collect 100 coins', 'Defeat all enemies')",
+     "lose_condition": "Clear lose condition (e.g., 'Health reaches 0', 'Fall off screen', 'Time runs out')",
+     "gameplay_loop": "Core gameplay loop in 1-2 sentences",
+     "visual_effects": ["particle_effects", "screen_shake", "animations", "lighting"],
+     "key_features": ["feature1", "feature2", "feature3"],
+     "difficulty": "{concept.get('difficulty', 'medium')}",
+     "target_audience": "{concept.get('target_audience', 'casual gamers')}"
+   }}
+
+3. QUALITY REQUIREMENTS:
+   - Be creative but practical
+   - Match the user's request closely
+   - Design should be implementable
+   - Colors should be harmonious
+   - Features should be achievable
+
+4. GENRE-SPECIFIC FOCUS:
+   - Platformer: Focus on jumping mechanics, level progression
+   - Runner: Focus on forward movement, obstacles, lanes
+   - Puzzle: Focus on puzzle mechanics, solutions
+   - Shooter: Focus on combat, weapons, enemies
+   - RPG: Focus on progression, stats, exploration
+
+Return ONLY valid JSON. No markdown. Make it detailed, creative, and production-ready."""
+            }
+        ]
+        
+        def parse_design(content: str) -> Dict:
+            """Parse game design response"""
+            if not content:
+                return None
+            
+            # Extract JSON from markdown code blocks
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                parts = content.split("```")
+                if len(parts) >= 3:
+                    content = parts[1].strip()
+                    if content.startswith("json"):
+                        content = content[4:].strip()
+            
+            if not content.startswith('{'):
+                start_idx = content.find('{')
+                end_idx = content.rfind('}')
+                if start_idx != -1 and end_idx != -1:
+                    content = content[start_idx:end_idx+1]
+            
+            try:
+                design = json.loads(content)
+                # Validate it's a dict
+                if not isinstance(design, dict):
+                    return None
+                design.update(concept)  # Merge with concept
+                logger.info(f"AI generated game design: {design.get('title')}")
+                return design
+            except (json.JSONDecodeError, ValueError, TypeError, KeyError) as e:
+                logger.debug(f"Parse error in design: {e}")
+                return None
+        
+        # Use retry mechanism with self-correction - 3 retries, no fallbacks
+        design = await _ai_retry_with_self_correction(
+            self.deepseek,
+            messages,
+            parse_design,
+            max_retries=3,
+            task_name="Game Design Generation"
+        )
+        
+        return design
+    
+    async def _generate_game_mechanics_with_ai(self, design: Dict) -> Dict:
+        """Generate game mechanics with DeepSeek AI - enhanced prompts for quality"""
+        genre = design.get('genre', 'platformer')
+        dimension = design.get('dimension', '2D')
+        
+        messages = [
+            {
+                "role": "system",
+                "content": "You are an expert game designer specializing in creating balanced, fun, and polished game mechanics. Your mechanics must be precise, well-tuned, and create engaging gameplay."
+            },
+            {
+                "role": "user",
+                "content": f"""Create PRODUCTION-QUALITY game mechanics for a {dimension} {genre} game.
+
+GAME DESIGN CONTEXT:
+{json.dumps(design, indent=2)}
+
+CRITICAL REQUIREMENTS - READ CAREFULLY:
+
+1. PHYSICS & MOVEMENT (MUST be precise):
+   - Player speed: 200-600 pixels/second (balanced for {genre})
+   - Jump force: -200 to -600 (negative = upward, must feel responsive)
+   - Gravity: 0.5-1.5 pixels/frame² (must feel natural)
+   - Acceleration: 1000-3000 (controls responsiveness)
+   - Friction: 800-2000 (controls stopping)
+   - Max fall speed: 400-800 (prevents falling too fast)
+
+2. GAME MECHANICS STRUCTURE:
+   {{
+     "player_movement": {{
+       "speed": number (200-600, balanced for {genre}),
+       "jump_force": number (negative, -200 to -600),
+       "acceleration": number (1000-3000),
+       "friction": number (800-2000),
+       "max_fall_speed": number (400-800),
+       "air_control": number (0.5-1.0, how much control in air)
+     }},
+     "physics": {{
+       "gravity": number (0.5-1.5, must be > 0),
+       "friction": number (0.05-0.2),
+       "air_resistance": number (0.0-0.1),
+       "bounce": number (0.0-0.3, for platforms)
+     }},
+     "game_loop": {{
+       "fps": 60,
+       "use_requestAnimationFrame": true,
+       "delta_time": true
+     }},
+     "collision": {{
+       "enabled": true,
+       "type": "aabb",
+       "precision": "medium"
+     }},
+     "enemy_behavior": {{
+       "speed": number (50-400, slower than player),
+       "ai_type": "patrol|chase|static",
+       "patrol_distance": number (100-500),
+       "detection_range": number (200-600)
+     }},
+     "collectible_system": {{
+       "types": ["coin", "gem", "powerup"],
+       "points_per_coin": number (10-50),
+       "points_per_gem": number (50-200),
+       "spawn_rate": number (0.1-0.5),
+       "respawn_time": number (5-30 seconds)
+     }},
+     "scoring": {{
+       "points_per_collectible": number (10-100),
+       "points_per_enemy": number (50-500),
+       "points_per_level": number (100-1000),
+       "combo_multiplier": number (1.0-2.0)
+     }},
+     "power_ups": ["speed_boost", "double_jump", "shield"],
+     "game_modes": ["normal", "time_trial"],
+     "difficulty_curve": {{
+       "enemy_spawn_rate": number (0.1-0.8),
+       "obstacle_density": number (0.2-0.7),
+       "speed_increase": number (1.0-1.5 per level)
+     }}
+   }}
+
+3. GENRE-SPECIFIC REQUIREMENTS:
+   - Platformer: Focus on precise jumping, platform spacing, enemy placement
+   - Runner: Focus on forward momentum, obstacle patterns, lane switching
+   - Puzzle: Focus on mechanics that enable puzzle solving
+   - Shooter: Focus on weapon mechanics, enemy AI, bullet physics
+   - RPG: Focus on stats, progression, combat mechanics
+
+4. BALANCE & FUN:
+   - Mechanics must feel responsive and satisfying
+   - Difficulty should ramp gradually
+   - Player should feel powerful but challenged
+   - All values must work together harmoniously
+
+5. VALIDATION RULES:
+   - speed > 0 and < 1000
+   - jump_force < 0 (negative)
+   - gravity > 0 and < 5
+   - All numbers must be valid floats
+   - No null or undefined values
+
+Return ONLY valid JSON. No markdown, no explanations. Make it balanced, fun, and production-ready."""
+            }
+        ]
+        
+        def parse_mechanics(content: str) -> Dict:
+            """Parse game mechanics response"""
+            if not content:
+                return None
+            
+            # Extract JSON from markdown code blocks
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                parts = content.split("```")
+                if len(parts) >= 3:
+                    content = parts[1].strip()
+                    if content.startswith("json"):
+                        content = content[4:].strip()
+            
+            if not content.startswith('{'):
+                start_idx = content.find('{')
+                end_idx = content.rfind('}')
+                if start_idx != -1 and end_idx != -1:
+                    content = content[start_idx:end_idx+1]
+            
+            try:
+                mechanics = json.loads(content)
+                # Validate it's a dict
+                if not isinstance(mechanics, dict):
+                    return None
+                logger.info("AI generated game mechanics")
+                return mechanics
+            except (json.JSONDecodeError, ValueError, TypeError, KeyError) as e:
+                logger.debug(f"Parse error in mechanics: {e}")
+                return None
+        
+        # Use retry mechanism with self-correction - 3 retries, no fallbacks
+        mechanics = await _ai_retry_with_self_correction(
+            self.deepseek,
+            messages,
+            parse_mechanics,
+            max_retries=3,
+            task_name="Game Mechanics Generation"
+        )
+        
+        return mechanics
     
     async def _generate_game_design(self, concept: Dict, prompt: str) -> Dict:
-        """Step 2: Generate detailed game design - Using DeepSeek R1"""
-        
-        referenced_game = concept.get('referenced_game')
-        game_style = concept.get('game_style', '')
-        key_features = concept.get('key_features', [])
-        
-        style_guidance = ""
-        if referenced_game:
-            style_guidance = f"""
-CRITICAL: The user wants a game like "{referenced_game}". You MUST create a design that:
-1. Matches the visual style and color palette of {referenced_game}
-2. Uses similar gameplay mechanics and feel
-3. Has the same level of polish and refinement
-4. Creates a game that looks and plays like {referenced_game}
-
-Key features to include: {', '.join(key_features) if key_features else 'Match the referenced game style'}
-"""
-        
-        messages = [
-            {
-                "role": "user",
-                "content": f"""You are a professional game designer specializing in creating polished, refined games that match popular game styles.
-
-Game concept: {json.dumps(concept)}
-                
-Original prompt: {prompt}
-
-{style_guidance}
-
-Return JSON with:
-- title: Catchy game title that matches the style
-- description: 2-3 sentence description emphasizing the gameplay feel
-- genre: Game genre
-- art_style: Visual style that matches the referenced game (e.g., "colorful 3D cartoon like Subway Surfers", "retro pixel art like Flappy Bird")
-- color_scheme: Color palette matching the referenced game style (use hex codes)
-- player_description: Detailed description of player character matching the visual style
-- enemy_description: What enemies/obstacles look like (match the style)
-- environment_description: Game world description matching the referenced game's environment
-- win_condition: How to win (match the referenced game's win condition if applicable)
-- lose_condition: How to lose (match the referenced game's lose condition)
-- gameplay_loop: Core gameplay loop description (e.g., "Run forward, swipe to dodge obstacles, collect coins, avoid enemies")
-- visual_effects: List of visual effects to include (particles, animations, etc.)
-
-Create a REFINED game design that looks and plays like the referenced game:"""
-            }
-        ]
-        
-        response = await self.deepseek.generate(messages, max_tokens=2000, temperature=0.6)
-        
-        try:
-            content = response['content']
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-            
-            design = json.loads(content)
-            return design
-        except:
-            return {
-                "title": "Gamora AI Game",
-                "description": prompt[:200],
-                "genre": concept.get("genre", "platformer"),
-                "art_style": "pixel art",
-                "color_scheme": {"primary": "#4A90E2", "secondary": "#50C878"},
-                "player_description": "A heroic character",
-                "environment_description": "A colorful game world"
-            }
+        """Step 2: Generate detailed game design - DISABLED: AI not used, fallback only"""
+        # TEMPLATE-ONLY MODE: Skip AI, use fallback
+        logger.info("TEMPLATE-ONLY MODE: Skipping AI game design, using fallback")
+        return {
+            "title": prompt[:50] if prompt else "Gamora Game",
+            "description": prompt[:200] if prompt else "A fun game",
+            "genre": concept.get("genre", "platformer"),
+            "art_style": "pixel art",
+            "color_scheme": {"primary": "#4A90E2", "secondary": "#50C878"},
+            "player_description": "A heroic character",
+            "environment_description": "A colorful game world"
+        }
     
     async def _generate_game_mechanics(self, design: Dict) -> Dict:
-        """Step 3: Generate game mechanics with DeepSeek"""
-        
-        gameplay_loop = design.get('gameplay_loop', '')
+        """Step 3: Generate game mechanics - DISABLED: AI not used, fallback only"""
+        # TEMPLATE-ONLY MODE: Skip AI, use fallback
+        logger.info("TEMPLATE-ONLY MODE: Skipping AI mechanics generation, using fallback")
         genre = design.get('genre', 'platformer')
         
-        # Add specific mechanics guidance based on genre
-        mechanics_guidance = ""
+        # Return fallback mechanics based on genre
         if 'endless_runner' in genre.lower() or 'runner' in genre.lower():
-            mechanics_guidance = """
-For endless runner games (like Subway Surfers, Temple Run):
-- player_movement: speed should be 400-600 (fast forward movement), jump_force around -500, acceleration 2000+
-- Add lane_switching: true (left/right movement between lanes)
-- Add swipe_controls: true (up=jump, down=slide, left/right=switch lanes)
-- obstacles: Should spawn dynamically, move toward player
-- collectibles: Coins/items spawn in lanes, need to collect while avoiding obstacles
-- progression: Speed increases over time, obstacles spawn more frequently
-- camera: Follows player, moves forward automatically
-"""
-        elif 'platformer' in genre.lower():
-            mechanics_guidance = """
-For platformer games (like Super Mario, Sonic):
-- player_movement: speed 300-400, jump_force -400 to -500, smooth acceleration/friction
-- Add wall_jump: false (can enable for advanced platformers)
-- Add double_jump: false (can enable for advanced platformers)
-- obstacles: Static platforms, moving platforms, spikes
-- collectibles: Coins, gems, power-ups scattered on platforms
-- progression: Level-based, increasing difficulty
-"""
-        
-        messages = [
-            {
-                "role": "user",
-                "content": f"""You are a game mechanics designer. Create REFINED, POLISHED game mechanics that match the style and feel of popular games.
-
-Game: {design.get('title', 'Game')}
-Genre: {genre}
-Description: {design.get('description', '')}
-Gameplay Loop: {gameplay_loop}
-Art Style: {design.get('art_style', '')}
-
-{mechanics_guidance}
-
-Return JSON with REFINED mechanics:
-- player_movement: {{speed: float (300-600 based on game type), jump_force: float (-400 to -600), acceleration: float (1500-2500), friction: float (1000-1500), max_fall_speed: float}}
-- player_abilities: List of abilities (e.g., ["jump", "move", "slide", "lane_switch"] for runners)
-- enemy_behaviors: List of enemy patterns matching the game style
-- collectibles: List with types, values, spawn rates (e.g., [{{"type": "coin", "value": 10, "spawn_rate": 0.3}}])
-- power_ups: List of power-ups matching the game style
-- obstacles: List of obstacles with descriptions
-- game_rules: Core rules that define gameplay
-- scoring_system: Detailed scoring (points per item, multipliers, combos)
-- progression: How difficulty/pace increases
-- camera_behavior: How camera follows player (for runners: "forward_follow", for platformers: "smooth_follow")
-- lane_system: For runners, number of lanes (usually 3)
-- spawn_system: How obstacles/collectibles spawn (for runners: "continuous_forward", for platformers: "static_placement")
-
-Make mechanics REFINED and match the polished feel of popular games:"""
+            return {
+                "player_movement": {
+                    "speed": 500.0,
+                    "jump_force": -500.0,
+                    "acceleration": 2000.0,
+                    "friction": 1500.0
+                },
+                "player_abilities": ["jump", "move", "slide", "lane_switch"],
+                "game_rules": ["Run forward", "Collect coins", "Avoid obstacles"],
+                "scoring_system": "Points per coin collected"
             }
-        ]
-        
-        response = await self.deepseek.generate(messages, temperature=0.3)
-        
-        try:
-            content = response['content']
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-            
-            mechanics = json.loads(content)
-            return mechanics
-        except:
+        else:
+            # Default platformer mechanics
             return {
                 "player_movement": {
                     "speed": 300.0,
@@ -610,8 +909,7 @@ Make mechanics REFINED and match the polished feel of popular games:"""
     async def _generate_game_code(self, design: Dict, mechanics: Dict) -> Dict:
         """Step 4: Generate GDScript code using AI with hybrid approach"""
         
-        # Use AI to generate code directly, but return structure for GodotService
-        # GodotService will use AICodeGenerator which has AI + fallback templates
+        # Web game service will generate code directly
         try:
             # Return structure indicating AI-powered generation
             return {
@@ -633,204 +931,262 @@ Make mechanics REFINED and match the polished feel of popular games:"""
             }
     
     async def _generate_ui_design(self, design: Dict) -> Dict:
-        """Step 6: Generate UI design with AI-powered detailed layouts"""
-        
-        genre = design.get('genre', 'platformer')
-        game_style = design.get('game_style', '')
-        referenced_game = design.get('referenced_game', '')
+        """Step 6: Generate UI design - DISABLED: AI not used, fallback only"""
+        # TEMPLATE-ONLY MODE: Skip AI, use fallback
+        logger.info("📋 TEMPLATE-ONLY MODE: Skipping AI UI design, using fallback")
         color_scheme = design.get('color_scheme', {})
-        
-        messages = [
-            {
-                "role": "user",
-                "content": f"""You are a UI/UX designer for games. Design a REFINED, POLISHED user interface that matches the game's style and genre.
-
-Game Context:
-- Title: {design.get('title', 'Game')}
-- Genre: {genre}
-- Style: {game_style}
-- Referenced Game: {referenced_game if referenced_game else 'None'}
-- Color Scheme: {json.dumps(color_scheme)}
-- Art Style: {design.get('art_style', '')}
-
-Your Task:
-Design a complete UI system that:
-1. Matches the visual style of the game
-2. Is intuitive and easy to use
-3. Provides clear feedback to the player
-4. Includes all necessary HUD elements
-5. Has a cohesive design language
-6. Works well for the game genre
-
-Return JSON with:
-- menu_style: Style description (e.g., "modern", "retro", "minimalist", "colorful")
-- font_style: Font characteristics (e.g., "bold", "rounded", "pixelated")
-- font_size: Base font size (number)
-- button_style: Button design (e.g., "rounded", "sharp", "gradient", "outlined")
-- hud_layout: Object with:
-  - score_position: "top_left" | "top_right" | "top_center"
-  - health_position: "top_left" | "top_right" | "top_center"
-  - health_display: "bar" | "number" | "icons"
-  - minimap: true/false
-  - power_up_indicators: true/false
-- color_theme: Object with:
-  - primary: Primary UI color (hex)
-  - secondary: Secondary UI color (hex)
-  - accent: Accent color (hex)
-  - background: Background color/transparency
-  - text: Text color (hex)
-- ui_elements: Array of UI element objects:
-  - type: "button", "label", "panel", "icon"
-  - name: Element name
-  - position: [x, y] or "top_left", "top_right", etc.
-  - size: [width, height]
-  - style: Style description
-  - animation: Animation type (e.g., "pulse", "slide", "fade")
-- menu_screens: Array of menu screen objects:
-  - name: "main_menu", "pause_menu", "game_over", "settings"
-  - layout: Layout description
-  - buttons: Array of button objects with labels and actions
-- feedback_effects: Array of visual feedback types (e.g., "score_popup", "damage_flash", "collectible_glow")
-
-Create a REFINED, POLISHED UI design that enhances the gameplay experience:"""
-            }
-        ]
-        
-        try:
-            response = await self.deepseek.generate(messages, temperature=0.4)
-            content = response['content']
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-            
-            ui_data = json.loads(content)
-            return ui_data
-        except Exception as e:
-            logger.warning(f"Failed to generate UI design: {e}")
-            # Fallback
         return {
             "menu_style": "modern",
             "font_size": 24,
             "button_style": "rounded",
-                "color_theme": color_scheme,
-                "hud_layout": {
-                    "score_position": "top_left",
-                    "health_position": "top_left",
-                    "health_display": "number"
-                }
+            "color_theme": color_scheme if color_scheme else {"primary": "#4A90E2", "secondary": "#50C878"},
+            "hud_layout": {
+                "score_position": "top_left",
+                "health_position": "top_left",
+                "health_display": "number"
+            }
         }
     
-    async def _generate_level_design(self, design: Dict, mechanics: Dict) -> Dict:
-        """Step 7: Generate level layouts with AI-powered detailed design"""
-        
+    async def _generate_level_design_with_ai(self, design: Dict, mechanics: Dict) -> Dict:
+        """Generate level design with DeepSeek AI - enhanced for quality"""
         genre = design.get('genre', 'platformer')
-        gameplay_loop = design.get('gameplay_loop', '')
-        referenced_game = design.get('referenced_game', '')
-        game_style = design.get('game_style', '')
         dimension = design.get('dimension', '2D')
         
-        # For endless runners, generate spawn patterns instead of static levels
-        if 'endless_runner' in genre.lower() or 'runner' in genre.lower() or dimension == '3D':
-            messages = [
-                {
-                    "role": "user",
-                    "content": f"""Design level/spawn patterns for an endless runner game.
-
-Game: {design.get('title', 'Game')}
-Gameplay: {gameplay_loop}
-Mechanics: {json.dumps(mechanics.get('obstacles', []))}
-
-Return JSON with:
-- spawn_patterns: List of obstacle/collectible patterns that repeat
-- lane_configuration: Number of lanes (usually 3)
-- difficulty_curve: How spawn rate increases over time
-- obstacle_combinations: Common obstacle combinations
-- collectible_placement: Where collectibles typically spawn
-
-Create patterns that feel polished and balanced:"""
-                }
-            ]
-            
-            try:
-                response = await self.deepseek.generate(messages, temperature=0.4)
-                content = response['content']
-                if "```json" in content:
-                    content = content.split("```json")[1].split("```")[0].strip()
-                elif "```" in content:
-                    content = content.split("```")[1].split("```")[0].strip()
-                
-                level_data = json.loads(content)
-                return level_data
-            except:
-                pass
-        
-        # For platformers, generate traditional level layouts (MAX 2 levels for starter game)
         messages = [
             {
+                "role": "system",
+                "content": "You are an expert level designer. Create well-designed, balanced levels that are fun, challenging, and progressively difficult."
+            },
+            {
                 "role": "user",
-                "content": f"""Design level layouts for a platformer game. This is a STARTER/KICKOFF game, not a full-scale game.
+                "content": f"""Create PRODUCTION-QUALITY level design for a {dimension} {genre} game.
 
-Game: {design.get('title', 'Game')}
-Genre: {genre}
-Mechanics: {json.dumps(mechanics)}
+GAME DESIGN:
+{json.dumps(design, indent=2)}
 
-Return JSON with:
-- levels: Array of EXACTLY 2 level objects (starter game, not full scale), each with:
-  - name: Level name
-  - difficulty: easy/medium (first easy, second can be medium)
-  - platforms: Array of platform objects with position [x, y] and size [width, height]
-  - enemies: Array of enemy objects with position [x, y] and type
-  - collectibles: Array of collectible objects with position [x, y] and type
-  - spawn_point: [x, y] for player start
-  - goal: [x, y] for level end
+GAME MECHANICS:
+{json.dumps(mechanics, indent=2)}
 
-IMPORTANT: Generate EXACTLY 2 levels maximum. This is a starter game. Make layouts REFINED, POLISHED, and error-free:"""
+LEVEL DESIGN REQUIREMENTS:
+
+For PLATFORMER games (2D side-scrolling):
+{{
+  "levels": [
+    {{
+      "name": "Level 1",
+      "difficulty": "easy",
+      "width": 1200,
+      "height": 800,
+      "platforms": [[x, y, width, height], ...],  // Ground platforms, must be reachable
+      "enemies": [[x, y], ...],  // Enemy positions, must be on platforms
+      "collectibles": [[x, y], ...],  // Collectible positions, must be reachable
+      "spawn_point": [x, y],  // Player start position
+      "goal": [x, y],  // End of level position
+      "checkpoints": [[x, y], ...],  // Optional checkpoints
+      "hazards": [[x, y, width, height], ...],  // Spikes, pits, etc.
+      "secrets": [[x, y], ...]  // Optional secret areas
+    }},
+    {{
+      "name": "Level 2",
+      "difficulty": "medium",
+      // Same structure, but more challenging
+    }}
+  ]
+}}
+
+For RUNNER games (endless or 3D):
+{{
+                    "spawn_patterns": [
+    {{
+      "obstacle_type": "barrier|hole|enemy",
+      "spawn_rate": 0.2-0.5,
+      "lane": "left|center|right|random",
+      "min_gap": 200-500,
+      "max_gap": 500-1000
+    }}
+  ],
+  "collectible_placement": "scattered|clustered|pattern",
+                    "lane_configuration": 3,
+  "difficulty_curve": "gradual|exponential",
+  "speed_increase": 1.0-1.2 per 1000 units
+}}
+
+CRITICAL DESIGN RULES:
+
+1. PLATFORMER LEVELS:
+   - Platforms must be reachable (max jump height: ~400px)
+   - Progression must be clear (left to right or up)
+   - Difficulty must ramp gradually
+   - Level 1: Easy, teaches basics
+   - Level 2: Medium, introduces challenges
+   - Platforms: [x, y, width, height] where y=0 is top, y increases downward
+   - Canvas size: 1200x800 (typical)
+   - Ground level: y=700-750
+   - Platform spacing: 200-400px apart
+   - Enemy placement: On platforms, not in air
+   - Collectibles: Reachable, rewarding placement
+
+2. RUNNER LEVELS:
+   - Obstacles must be avoidable
+   - Patterns must create rhythm
+   - Difficulty must increase gradually
+   - Gaps between obstacles: 300-800px
+   - Lane variety: Mix of left/center/right
+
+3. BALANCE:
+   - Level 1: Tutorial-like, easy to complete
+   - Level 2: Moderate challenge, tests skills
+   - Collectibles: 3-8 per level
+   - Enemies: 1-3 per level (Level 1), 2-5 (Level 2)
+   - Platforms: 3-6 per level
+
+4. VALIDATION:
+   - All coordinates must be within canvas bounds (0-1200 x, 0-800 y)
+   - Platforms must not overlap unreasonably
+   - Spawn point must be on ground/platform
+   - Goal must be reachable
+   - No impossible jumps (max ~400px horizontal, ~300px vertical)
+
+Return ONLY valid JSON. No markdown. Make levels fun, balanced, and well-designed."""
             }
         ]
         
-        try:
-            response = await self.deepseek.generate(messages, temperature=0.4)
-            content = response['content']
+        def parse_level_design(content: str) -> Dict:
+            if not content:
+                return None
+            
             if "```json" in content:
                 content = content.split("```json")[1].split("```")[0].strip()
             elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
+                parts = content.split("```")
+                if len(parts) >= 3:
+                    content = parts[1].strip()
+                    if content.startswith("json"):
+                        content = content[4:].strip()
             
-            level_data = json.loads(content)
+            if not content.startswith('{'):
+                start_idx = content.find('{')
+                end_idx = content.rfind('}')
+                if start_idx != -1 and end_idx != -1:
+                    content = content[start_idx:end_idx+1]
             
-            # Limit to maximum 2 levels (starter game)
-            if 'levels' in level_data and isinstance(level_data['levels'], list):
-                if len(level_data['levels']) > 2:
-                    logger.info(f"Limiting levels from {len(level_data['levels'])} to 2 (starter game)")
-                    level_data['levels'] = level_data['levels'][:2]
+            try:
+                level_design = json.loads(content)
+                if not isinstance(level_design, dict):
+                    return None
+                
+                # Validate and fix level design
+                level_design = self._validate_and_fix_level_design(level_design, design)
+                logger.info("✅ AI generated level design")
+                return level_design
+            except (json.JSONDecodeError, ValueError, TypeError, KeyError) as e:
+                logger.debug(f"Parse error in level design: {e}")
+                return None
+        
+        level_design = await _ai_retry_with_self_correction(
+            self.deepseek,
+            messages,
+            parse_level_design,
+            max_retries=3,
+            task_name="Level Design Generation"
+        )
+        
+        return level_design
+    
+    def _validate_and_fix_level_design(self, level_design: Dict, game_design: Dict) -> Dict:
+        """Validate and fix level design to ensure it's playable"""
+        genre = game_design.get('genre', 'platformer')
+        dimension = game_design.get('dimension', '2D')
+        
+        if 'endless_runner' in genre.lower() or 'runner' in genre.lower() or dimension == '3D':
+            if 'spawn_patterns' not in level_design:
+                level_design['spawn_patterns'] = [
+                    {"obstacle_type": "barrier", "spawn_rate": 0.3, "lane": "random"},
+                    {"obstacle_type": "hole", "spawn_rate": 0.2, "lane": "random"}
+                ]
+            return level_design
+        
+        if 'levels' not in level_design:
+            level_design['levels'] = []
+        
+        levels = level_design['levels']
+        if not isinstance(levels, list):
+            levels = []
+        
+        # Ensure we have at least 2 levels, max 2
+        if len(levels) == 0:
+            levels = [self._create_default_level(1, "easy"), self._create_default_level(2, "medium")]
+        elif len(levels) == 1:
+            levels.append(self._create_default_level(2, "medium"))
+        elif len(levels) > 2:
+            levels = levels[:2]
+        
+        # Validate each level
+        for i, level in enumerate(levels):
+            if not isinstance(level, dict):
+                levels[i] = self._create_default_level(i+1, "easy" if i == 0 else "medium")
+                continue
             
-            return level_data
-        except Exception as e:
-            logger.warning(f"Failed to generate level design: {e}")
-            # Fallback - exactly 2 levels for starter game
-        return {
-            "levels": [
-                {
-                    "name": "Level 1",
-                    "difficulty": "easy",
-                        "platforms": [[0, 500, 200, 64], [300, 400, 200, 64], [600, 300, 200, 64]],
-                        "enemies": [[400, 350]],
-                        "collectibles": [[150, 450], [350, 350], [650, 250]],
-                        "spawn_point": [100, 400],
-                        "goal": [800, 200]
-                    },
-                    {
+            # Ensure required fields
+            if 'name' not in level:
+                level['name'] = f"Level {i+1}"
+            if 'difficulty' not in level:
+                level['difficulty'] = "easy" if i == 0 else "medium"
+            if 'platforms' not in level:
+                level['platforms'] = [[0, 700, 200, 64], [300, 600, 200, 64], [600, 500, 200, 64]]
+            if 'enemies' not in level:
+                level['enemies'] = []
+            if 'collectibles' not in level:
+                level['collectibles'] = [[150, 650], [350, 550], [650, 450]]
+            if 'spawn_point' not in level:
+                level['spawn_point'] = [100, 650]
+            if 'goal' not in level:
+                level['goal'] = [1000, 400]
+            
+            # Validate coordinates are within bounds
+            canvas_width, canvas_height = 1200, 800
+            level['platforms'] = [[max(0, min(x, canvas_width-200)), max(0, min(y, canvas_height-64)), w, h] 
+                                  for x, y, w, h in level['platforms']]
+            level['enemies'] = [[max(0, min(x, canvas_width)), max(0, min(y, canvas_height))] 
+                               for x, y in level['enemies']]
+            level['collectibles'] = [[max(0, min(x, canvas_width)), max(0, min(y, canvas_height))] 
+                                     for x, y in level['collectibles']]
+            
+            spawn = level['spawn_point']
+            level['spawn_point'] = [max(0, min(spawn[0], canvas_width)), max(0, min(spawn[1], canvas_height))]
+            
+            goal = level['goal']
+            level['goal'] = [max(0, min(goal[0], canvas_width)), max(0, min(goal[1], canvas_height))]
+        
+        level_design['levels'] = levels
+        return level_design
+    
+    def _create_default_level(self, level_num: int, difficulty: str) -> Dict:
+        """Create a default level structure"""
+        if level_num == 1:
+            return {
+                        "name": "Level 1",
+                        "difficulty": "easy",
+                "platforms": [[0, 700, 200, 64], [300, 600, 200, 64], [600, 500, 200, 64]],
+                "enemies": [[400, 550]],
+                "collectibles": [[150, 650], [350, 550], [650, 450]],
+                "spawn_point": [100, 650],
+                "goal": [1000, 400]
+            }
+        else:
+            return {
                         "name": "Level 2",
                         "difficulty": "medium",
-                        "platforms": [[0, 500, 200, 64], [250, 400, 200, 64], [500, 300, 200, 64], [750, 200, 200, 64]],
-                        "enemies": [[350, 350], [600, 250]],
-                        "collectibles": [[100, 450], [300, 350], [550, 250], [800, 150]],
-                        "spawn_point": [100, 400],
-                        "goal": [900, 150]
-                }
-            ]
-        }
+                "platforms": [[0, 700, 200, 64], [250, 600, 200, 64], [500, 500, 200, 64], [750, 400, 200, 64]],
+                "enemies": [[350, 550], [600, 450]],
+                "collectibles": [[100, 650], [300, 550], [550, 450], [800, 350]],
+                "spawn_point": [100, 650],
+                "goal": [1100, 350]
+            }
+    
+    async def _generate_level_design(self, design: Dict, mechanics: Dict) -> Dict:
+        """Legacy method - redirects to AI generation"""
+        return await self._generate_level_design_with_ai(design, mechanics)
     
     async def _update_status(self, project_id: str, status: str, message: str):
         """Update generation status and notify via WebSocket"""
@@ -857,85 +1213,124 @@ IMPORTANT: Generate EXACTLY 2 levels maximum. This is a starter game. Make layou
             })
     
     async def _validate_game_content(self, ai_content: Dict, build_result: Dict) -> List[str]:
-        """Validate game content for errors and issues before completion
-        
-        Returns:
-            List of error/warning messages (empty if all good)
         """
-        
-        errors = []
+        Simplified validation - just check if game was built successfully
+        Since AI generates everything directly in HTML, we don't need to validate structured data
+        """
         warnings = []
         
-        # Check game design
-        game_design = ai_content.get('game_design', {})
-        if not game_design:
-            errors.append("Missing game_design")
-        else:
-            if not game_design.get('title'):
-                warnings.append("Game title is missing")
-            if not game_design.get('genre'):
-                warnings.append("Game genre is missing")
-            dimension = game_design.get('dimension', '2D')
-            if dimension not in ['2D', '3D']:
-                errors.append(f"Invalid dimension: {dimension} (must be 2D or 3D)")
-                # Auto-fix: convert to 3D if invalid
-                if dimension and ('4' in str(dimension) or '5' in str(dimension)):
-                    game_design['dimension'] = '3D'
-                    logger.info(f"Auto-fixed dimension from {dimension} to 3D")
-                else:
-                    game_design['dimension'] = '2D'
-        
-        # Check level design - limit to 2 levels
-        level_design = ai_content.get('level_design', {})
-        if 'levels' in level_design:
-            levels = level_design['levels']
-            if not isinstance(levels, list):
-                errors.append("Levels must be an array")
-            elif len(levels) > 2:
-                warnings.append(f"Too many levels ({len(levels)}), limiting to 2 for starter game")
-                level_design['levels'] = levels[:2]
-            elif len(levels) == 0:
-                warnings.append("No levels generated")
-        
-        # Check game mechanics
-        game_mechanics = ai_content.get('game_mechanics', {})
-        if not game_mechanics:
-            warnings.append("Missing game_mechanics")
-        else:
-            player_movement = game_mechanics.get('player_movement', {})
-            if player_movement:
-                speed = player_movement.get('speed', 0)
-                if speed <= 0 or speed > 1000:
-                    warnings.append(f"Player speed seems invalid: {speed}")
-                    # Auto-fix: set reasonable default
-                    if speed <= 0:
-                        player_movement['speed'] = 300.0
-                    elif speed > 1000:
-                        player_movement['speed'] = 600.0
-        
-        # Check build result
+        # Only check if build was successful
         if not build_result.get('success'):
-            error_msg = build_result.get('error', 'Unknown build error')
-            warnings.append(f"Build had issues: {error_msg}")
+            warnings.append(f"Build had issues: {build_result.get('error', 'Unknown error')}")
         
-        # Check assets
-        assets = ai_content.get('assets', [])
-        if not assets or len(assets) == 0:
-            warnings.append("No assets generated")
+        # That's it - trust the AI generated code
+        return warnings
+    
+    def _validate_and_fix_mechanics(self, game_mechanics: Dict) -> Dict:
+        """Validate and fix game mechanics to ensure they're correct - ENHANCED"""
+        if not game_mechanics:
+            game_mechanics = {}
         
-        # Log errors and warnings
-        if errors:
-            logger.error(f"❌ Validation errors: {errors}")
-        if warnings:
-            logger.warning(f"⚠️  Validation warnings: {warnings}")
+        validated = game_mechanics.copy()
         
-        return errors + warnings
+        # Validate player_movement - CRITICAL
+        player_movement = validated.get('player_movement', {})
+        if not player_movement:
+            player_movement = {}
+        
+        # Speed validation - MUST be valid
+        speed = player_movement.get('speed', 0)
+        if speed <= 0:
+            logger.warning(f"Invalid player speed: {speed}, fixing to 300.0")
+            player_movement['speed'] = 300.0
+        elif speed > 1000:
+            logger.warning(f"Player speed too high: {speed}, capping to 600.0")
+            player_movement['speed'] = 600.0
+        elif speed < 50:
+            logger.warning(f"Player speed too low: {speed}, setting to 100.0")
+            player_movement['speed'] = max(100.0, speed)
+        
+        # Jump force validation - MUST be negative
+        jump_force = player_movement.get('jump_force', 0)
+        if jump_force == 0:
+            logger.warning("Jump force is 0, fixing to -400.0")
+            player_movement['jump_force'] = -400.0
+        elif jump_force > 0:
+            logger.warning(f"Jump force is positive: {jump_force}, fixing to negative")
+            player_movement['jump_force'] = -abs(jump_force)
+        elif jump_force < -800:
+            logger.warning(f"Jump force too strong: {jump_force}, capping to -600.0")
+            player_movement['jump_force'] = -600.0
+        elif jump_force > -100:
+            logger.warning(f"Jump force too weak: {jump_force}, setting to -200.0")
+            player_movement['jump_force'] = -200.0
+        
+        # Acceleration and friction
+        if 'acceleration' not in player_movement:
+            player_movement['acceleration'] = 1500.0
+        if 'friction' not in player_movement:
+            player_movement['friction'] = 1200.0
+        
+        validated['player_movement'] = player_movement
+        
+        # Validate physics - CRITICAL
+        physics = validated.get('physics', {})
+        if not physics:
+            physics = {}
+        
+        gravity = physics.get('gravity', 0)
+        if gravity <= 0:
+            logger.warning(f"Invalid gravity: {gravity}, fixing to 0.8")
+            physics['gravity'] = 0.8
+        elif gravity > 5:
+            logger.warning(f"Gravity too high: {gravity}, capping to 2.0")
+            physics['gravity'] = 2.0
+        
+        if 'friction' not in physics:
+            physics['friction'] = 0.1
+        if 'air_resistance' not in physics:
+            physics['air_resistance'] = 0.0
+        
+        validated['physics'] = physics
+        
+        # Validate game loop
+        if 'game_loop' not in validated:
+            validated['game_loop'] = {'fps': 60, 'use_requestAnimationFrame': True}
+        else:
+            game_loop = validated['game_loop']
+            if 'fps' not in game_loop or game_loop.get('fps', 0) <= 0:
+                game_loop['fps'] = 60
+            if 'use_requestAnimationFrame' not in game_loop:
+                game_loop['use_requestAnimationFrame'] = True
+        
+        # Validate scoring
+        if 'scoring' not in validated:
+            validated['scoring'] = {
+                'points_per_collectible': 10,
+                'points_per_enemy': 50,
+                'points_per_level': 100
+            }
+        
+        # Validate collision
+        if 'collision' not in validated:
+            validated['collision'] = {
+                'enabled': True,
+                'type': 'aabb',  # Axis-Aligned Bounding Box
+                'precision': 'medium'
+            }
+        
+        logger.info(f"✅ Validated mechanics: speed={player_movement.get('speed')}, jump={player_movement.get('jump_force')}, gravity={physics.get('gravity')}")
+        
+        return validated
     
     def _create_fallback_design(self, concept: Dict, prompt: str) -> Dict:
         """Create fallback game design that matches user intent"""
-        genre = concept.get('genre', 'platformer')
-        dimension = concept.get('dimension', '2D')
-        theme = concept.get('theme', 'adventure')
+        # Handle None concept
+        if concept is None:
+            concept = {}
+        genre = concept.get('genre', 'platformer') if concept else 'platformer'
+        dimension = concept.get('dimension', '2D') if concept else '2D'
+        theme = concept.get('theme', 'adventure') if concept else 'adventure'
         
         return {
             "title": f"{genre.title()} Adventure",
@@ -1009,21 +1404,13 @@ IMPORTANT: Generate EXACTLY 2 levels maximum. This is a starter game. Make layou
             }
     
     def _create_fallback_scripts(self, design: Dict, mechanics: Dict) -> Dict:
-        """Create fallback game scripts using the script generator"""
-        try:
-            from services.gdscript_generator import GDScriptGenerator
-            generator = GDScriptGenerator()
-            scripts = generator.generate_all_scripts(design, mechanics)
-            logger.info(f"✅ Generated {len(scripts)} fallback scripts using GDScriptGenerator")
-            return scripts
-        except Exception as e:
-            logger.error(f"Failed to generate fallback scripts with generator: {e}", exc_info=True)
-            # Return a valid dict structure (scripts will be generated by GodotService)
-            return {
-                "scripts_generated_by": "godot_service_fallback",
-                "custom_scripts": {},
-                "note": "Scripts will be generated by GodotService using GDScriptGenerator"
-            }
+        """Create fallback game scripts - returns structure for web game service"""
+        # Web game service will generate code directly
+        return {
+            "scripts_generated_by": "web_game_service",
+            "use_ai": True,
+            "custom_scripts": {}
+        }
     
     def _create_fallback_ui_design(self, design: Dict) -> Dict:
         """Create fallback UI design"""

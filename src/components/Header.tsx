@@ -40,7 +40,7 @@ const Header = () => {
               "
               title="Go to homepage"
             >
-              Gamora
+              Gamora AI
             </h1>
           </div>
 

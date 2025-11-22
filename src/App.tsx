@@ -17,7 +17,6 @@ import ChatInterface from "@/components/ChatInterface";
 import GamoraAIMain from "@/components/GamoraAIMain";
 import GamoraAIDashboard from "@/components/GamoraAIDashboard";
 import SignInPage from "./pages/SignInPage";
-import TestPreview from "./pages/TestPreview"; // TEMPORARY - DELETE AFTER TESTING
 import ProtectedRoute from "@/components/ProtectedRoute";
 import Header from "@/components/Header"; // header
 import { AuthProvider } from "@/hooks/useAuth"; // auth provider
@@ -32,8 +31,7 @@ const AppContent = () => {
   const hideHeader = location.pathname === "/signin" || 
                       location.pathname === "/chat" || 
                       location.pathname === "/chat-main" || 
-                      location.pathname === "/chat-dashboard" ||
-                      location.pathname === "/test-preview"; // TEMPORARY
+                      location.pathname === "/chat-dashboard";
 
   return (
     <>
@@ -79,8 +77,6 @@ const AppContent = () => {
         {/* Auth page */}
         <Route path="/signin" element={<SignInPage />} />
 
-        {/* TEMPORARY TEST PAGE - DELETE AFTER TESTING */}
-        <Route path="/test-preview" element={<TestPreview />} />
 
         {/* Example protected page later */}
         {/* 

@@ -26,8 +26,6 @@ dist-ssr
 # Asset files (stored in Supabase Storage)
 core/assets/curated/**
 !core/assets/curated/metadata/
-!core/assets/curated/README.md
-!core/assets/curated/download_assets.py
 core/assets/curated/temp_downloads/
 
 # Godot executables and large files
@@ -35,6 +33,12 @@ Godot/**/*.exe
 Godot/**/*.app
 Godot/**/*.dmg
 Godot/**/*.zip
+
+# Generated projects and runtime data (should not be in repo)
+core/projects/
+core/web_projects/
+projects/
+web_projects/
 
 # Exported game builds (should not be in repo)
 **/exports/*.exe
@@ -49,3 +53,10 @@ Godot/**/*.zip
 # Large binary files (over 50MB)
 *.exe
 !node_modules/**/*.exe
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python

@@ -1,9 +1,11 @@
-"""
-API Routes - REST and WebSocket endpoints
-"""
+"""API Routes"""
 
+import asyncio
 from fastapi import APIRouter, HTTPException, Depends, WebSocket, WebSocketDisconnect, Header, Query, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse, HTMLResponse
+import zipfile
+import io
+from pathlib import Path
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 import logging
@@ -14,7 +16,6 @@ import re
 
 logger = logging.getLogger(__name__)
 
-# Request/Response models
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
@@ -42,24 +43,36 @@ class ProjectResponse(BaseModel):
     builds: Optional[dict]
     created_at: str
 
-# Initialize routers
 auth_router = APIRouter()
 projects_router = APIRouter()
 generation_router = APIRouter()
 
 
-# Dependency to get components
 def get_components():
     from main import components
     return components
 
 
-# Dependency to get current user
+def get_component(components: dict, key: str, required: bool = True):
+    from services.code_validator import validate_component_keys
+    
+    if key not in components:
+        if required:
+            missing = validate_component_keys(components, [key])
+            if missing:
+                logger.error(f"❌ Missing required component: '{key}'")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Server configuration error: Missing component '{key}'"
+                )
+        return None
+    return components[key]
+
+
 async def get_current_user(
     authorization: Optional[str] = Header(None),
     components = Depends(get_components)
 ):
-    """Extract and verify Supabase JWT token"""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
     
@@ -73,11 +86,8 @@ async def get_current_user(
     return user
 
 
-# ============= AUTH ROUTES =============
-
 @auth_router.post("/register", response_model=AuthResponse)
 async def register(request: RegisterRequest, components = Depends(get_components)):
-    """Register new user"""
     try:
         auth_manager = components['auth']
         result = await auth_manager.register_user(request.email, request.password)
@@ -91,7 +101,6 @@ async def register(request: RegisterRequest, components = Depends(get_components
 
 @auth_router.post("/login", response_model=AuthResponse)
 async def login(request: LoginRequest, components = Depends(get_components)):
-    """Login user"""
     try:
         auth_manager = components['auth']
         result = await auth_manager.login_user(request.email, request.password)
@@ -105,11 +114,8 @@ async def login(request: LoginRequest, components = Depends(get_components)):
 
 @auth_router.get("/me")
 async def get_me(current_user = Depends(get_current_user)):
-    """Get current user info"""
     return current_user
 
-
-# ============= PROJECT ROUTES =============
 
 @projects_router.get("/{project_id}", response_model=ProjectResponse)
 async def get_project(
@@ -117,7 +123,6 @@ async def get_project(
     current_user = Depends(get_current_user),
     components = Depends(get_components)
 ):
-    """Get project details"""
     db = components['db']
     project = await db.get_project(project_id)
     
@@ -133,8 +138,8 @@ async def get_project(
         "title": project['title'],
         "description": project['description'],
         "status": project['status'],
-        "web_preview_url": project['web_preview_url'],
-        "builds": project['builds'],
+        "web_preview_url": project.get('web_preview_url'),  # May not exist if generation failed
+        "builds": project.get('builds', {}),
         "created_at": project['created_at'].isoformat()
     }
 
@@ -146,7 +151,6 @@ async def list_projects(
     current_user = Depends(get_current_user),
     components = Depends(get_components)
 ):
-    """List user's projects"""
     db = components['db']
     projects = await db.get_user_projects(
         user_id=current_user['user_id'],
@@ -160,15 +164,13 @@ async def list_projects(
             "title": p['title'],
             "description": p['description'],
             "status": p['status'],
-            "web_preview_url": p['web_preview_url'],
-            "builds": p['builds'],
+            "web_preview_url": p.get('web_preview_url'),  # May not exist if generation failed
+            "builds": p.get('builds', {}),
             "created_at": p['created_at'].isoformat()
         }
         for p in projects
     ]
 
-
-# ============= GENERATION ROUTES =============
 
 @generation_router.post("/game")
 async def generate_game(
@@ -176,7 +178,6 @@ async def generate_game(
     current_user = Depends(get_current_user),
     components = Depends(get_components)
 ):
-    """Start game generation (async)"""
     try:
         # Rate limiting
         rate_limiter = components['rate_limiter']
@@ -192,11 +193,8 @@ async def generate_game(
                 detail="Rate limit exceeded. Try again later."
             )
         
-        # Create project
         project_id = str(uuid.uuid4())
         db = components['db']
-        
-        # Supabase uses UUID strings for user_id
         user_id = str(current_user['user_id'])
         
         await db.create_project(
@@ -207,40 +205,32 @@ async def generate_game(
             prompt=request.prompt
         )
         
-        # Start generation in background (fire and forget)
         import asyncio
         orchestrator = components['orchestrator']
         ws_manager = components['ws_manager']
         
         async def generation_task():
-            """Background task for game generation"""
             try:
-                # Create progress callback
                 async def progress_callback(progress_data):
                     await ws_manager.send_message(project_id, {
                         "type": "progress",
                         "data": progress_data
                     })
                 
-                # Generate game
                 result = await orchestrator.generate_game(
                     project_id=project_id,
                     user_prompt=request.prompt,
-                    user_tier="free",  # TODO: Get from user profile
+                    user_tier="free",
                     db_manager=db
                 )
                 
-                # Update project with results
                 if result['success']:
-                    # Clean ai_content to remove binary data before saving to database
                     ai_content = result.get('ai_content', {})
                     if isinstance(ai_content, dict):
-                        # Remove binary data from assets if present
                         if 'assets' in ai_content and isinstance(ai_content['assets'], list):
                             cleaned_assets = []
                             for asset in ai_content['assets']:
                                 if isinstance(asset, dict):
-                                    # Keep metadata but remove binary data
                                     cleaned_asset = {k: v for k, v in asset.items() if not isinstance(v, bytes)}
                                     cleaned_assets.append(cleaned_asset)
                                 else:
@@ -254,7 +244,6 @@ async def generate_game(
                         completed_at=datetime.utcnow()
                     )
                     
-                    # Save builds
                     builds_dict = result.get('builds', {})
                     for platform, url in builds_dict.items():
                         await db.create_build(
@@ -265,12 +254,13 @@ async def generate_game(
                             status='completed'
                         )
                     
-                    # Send completion message
+                    preview_url = result.get('preview_url') or result.get('web_preview_url')
                     await ws_manager.send_message(project_id, {
                         "type": "complete",
                         "data": {
                             "project_id": project_id,
-                            "web_preview_url": result.get('web_preview_url'),
+                            "preview_url": preview_url,
+                            "web_preview_url": preview_url,
                             "builds": builds_dict
                         }
                     })
@@ -293,7 +283,6 @@ async def generate_game(
                     "data": {"error": str(e)}
                 })
         
-        # Start background task
         asyncio.create_task(generation_task())
         
         return {
@@ -317,8 +306,6 @@ async def websocket_endpoint(
     token: Optional[str] = Query(None),
     components = Depends(get_components)
 ):
-    """WebSocket endpoint for real-time progress updates"""
-    # Verify authentication (token from query param)
     if token:
         auth_manager = components['auth']
         user = auth_manager.get_current_user(token)
@@ -327,11 +314,9 @@ async def websocket_endpoint(
             return
     
     ws_manager = components['ws_manager']
-    
     await ws_manager.connect(websocket, project_id)
     
     try:
-        # Send initial message
         await websocket.send_json({
             "type": "connected",
             "data": {
@@ -340,18 +325,14 @@ async def websocket_endpoint(
             }
         })
         
-        # Keep connection alive
         while True:
-            # Wait for messages (if client sends any)
             try:
                 data = await websocket.receive_text()
-                # Echo back (optional)
                 await websocket.send_json({
                     "type": "echo",
                     "data": {"received": data}
                 })
             except:
-                # Client disconnected or error
                 break
             
     except WebSocketDisconnect:
@@ -367,156 +348,68 @@ async def proxy_game_preview(
     project_id: str,
     components = Depends(get_components)
 ):
-    """
-    Proxy endpoint to serve game preview HTML with proper headers
-    This bypasses Supabase Storage's restrictive CSP
-    
-    The HTML is served from our backend, but assets (.wasm, .pck) are loaded
-    from Supabase using relative paths that work because we set the base URL
-    """
     try:
         storage_service = components['storage']
-        storage_path = f"games/{project_id}/preview/index.html"
         
         logger.info(f"🔍 Attempting to load preview for project: {project_id}")
-        logger.info(f"📁 Storage path: {storage_path}")
         
-        # Download HTML from Supabase
+        web_storage_path = f"web_games/{project_id}/index.html"
+        
+        html_content = None
+        asset_base_url = None
+        
+        # Try web game first (HTML5 games are in web_games/{project_id}/index.html)
         try:
-            html_content_bytes = await storage_service.download_file(storage_path)
+            html_content_bytes = await storage_service.download_file(web_storage_path)
             html_content = html_content_bytes.decode('utf-8')
-            logger.info(f"✅ Successfully downloaded HTML ({len(html_content)} bytes)")
-        except Exception as download_error:
-            logger.error(f"❌ Failed to download HTML: {download_error}")
-            # Try to list files in the project directory for debugging
+            logger.info(f"✅ Found HTML5 game preview at {web_storage_path} ({len(html_content)} bytes)")
+            
+            # Get Supabase public URL for web game assets (HTML5 games use root/assets)
+            from config.settings import Settings
+            settings = Settings()
+            supabase_url = settings.supabase_url.rstrip('/')
+            bucket = storage_service.bucket
+            asset_base_url = f"{supabase_url}/storage/v1/object/public/{bucket}/web_games/{project_id}"
+            
+            # For HTML5 games, ensure assets load correctly
+            # HTML5 games reference assets like ./assets/player.png
+            # We need to make sure the base URL is set correctly
+            if '<head>' in html_content and 'base href' not in html_content.lower():
+                # Add base tag for asset loading (only if not already present)
+                base_tag = f'<base href="{asset_base_url}/">'
+                html_content = html_content.replace('<head>', f'<head>\n    {base_tag}', 1)
+                logger.info("Added base tag for HTML5 asset loading")
+            
+        except Exception as web_error:
+            logger.debug(f"Web game not found at {web_storage_path}: {web_error}")
+            # Try src/index.html if dist doesn't exist
             try:
-                # This might not work depending on storage implementation, but worth trying
-                logger.error(f"💡 Project directory: games/{project_id}/")
-            except:
-                pass
-            raise HTTPException(
-                status_code=404, 
-                detail=f"Game preview not found. Make sure the project has been built. Error: {str(download_error)}"
-            )
+                src_storage_path = f"web_games/{project_id}/src/index.html"
+                html_content_bytes = await storage_service.download_file(src_storage_path)
+                html_content = html_content_bytes.decode('utf-8')
+                logger.info(f"Found web game in src directory ({len(html_content)} bytes)")
+                
+                from config.settings import Settings
+                settings = Settings()
+                supabase_url = settings.supabase_url.rstrip('/')
+                bucket = storage_service.bucket
+                asset_base_url = f"{supabase_url}/storage/v1/object/public/{bucket}/web_games/{project_id}/src"
+            except Exception as src_error:
+                logger.debug(f"Web game not found in dist or src: {web_error}, {src_error}")
+                html_content = None
         
-        # Get Supabase public URL for assets
-        from config.settings import Settings
-        settings = Settings()
-        supabase_url = settings.supabase_url.rstrip('/')
-        bucket = storage_service.bucket
-        
-        # Calculate the base URL for assets (same directory as index.html)
-        asset_base_url = f"{supabase_url}/storage/v1/object/public/{bucket}/games/{project_id}/preview"
-        
-        # Modify HTML to fix Godot HTML5 export issues
-        if '<head>' in html_content:
-            # Add base tag so relative paths resolve to Supabase
-            base_tag = f'<base href="{asset_base_url}/">'
-            html_content = html_content.replace('<head>', f'<head>\n{base_tag}', 1)
-        
-        # Disable ServiceWorker registration to avoid origin mismatch errors
-        # Godot HTML5 exports try to register a service worker, which fails when served from a different origin
-        # More aggressive removal - catch all variations
-        
-        # Remove entire service worker registration blocks
-        html_content = re.sub(
-            r'navigator\.serviceWorker\.register\([^)]*\)[^;]*;?',
-            '// ServiceWorker disabled',
-            html_content,
-            flags=re.MULTILINE
-        )
-        
-        # Remove service worker checks and registrations in if statements
-        html_content = re.sub(
-            r'if\s*\([^)]*serviceWorker[^)]*\)\s*\{[^}]*register\([^}]*\}',
-            '// ServiceWorker registration disabled',
-            html_content,
-            flags=re.DOTALL | re.IGNORECASE
-        )
-        
-        # Remove service worker event listeners
-        html_content = re.sub(
-            r'navigator\.serviceWorker\.(addEventListener|oncontrollerchange|onmessage)[^;]*;?',
-            '// ServiceWorker event listener disabled',
-            html_content,
-            flags=re.IGNORECASE
-        )
-        
-        # Remove service worker script tags entirely
-        html_content = re.sub(
-            r'<script[^>]*service[_-]?worker[^>]*>.*?</script>',
-            '<!-- ServiceWorker script removed -->',
-            html_content,
-            flags=re.IGNORECASE | re.DOTALL
-        )
-        
-        # Override navigator.serviceWorker entirely - inject at the very beginning
-        # This must run before any Godot code tries to register a service worker
-        service_worker_override = '''<script>
-// Override ServiceWorker to prevent registration errors (injected by proxy)
-(function() {
-    if (typeof navigator !== 'undefined' && navigator.serviceWorker) {
-        const originalRegister = navigator.serviceWorker.register.bind(navigator.serviceWorker);
-        navigator.serviceWorker.register = function() {
-            console.log('[Proxy] ServiceWorker registration disabled for cross-origin serving');
-            return Promise.reject(new DOMException('ServiceWorker registration disabled', 'NotAllowedError'));
-        };
-        // Also override getRegistration and getRegistrations
-        if (navigator.serviceWorker.getRegistration) {
-            navigator.serviceWorker.getRegistration = function() {
-                return Promise.resolve(null);
-            };
-        }
-        if (navigator.serviceWorker.getRegistrations) {
-            navigator.serviceWorker.getRegistrations = function() {
-                return Promise.resolve([]);
-            };
-        }
-    }
-})();
-</script>'''
-        
-        # Insert at the very beginning of <head> or before first <script>
-        if '<head>' in html_content:
-            html_content = html_content.replace('<head>', '<head>\n' + service_worker_override, 1)
-        elif '<script' in html_content:
-            # If no head tag, insert before first script
-            html_content = re.sub(
-                r'(<script[^>]*>)',
-                service_worker_override + r'\n\1',
-                html_content,
-                count=1
-            )
-        
-        # Fix asset paths in the HTML - ensure .pck and .wasm files use absolute URLs
-        # Godot exports reference files like "game.pck" or "game.wasm" - need to make them absolute
-        # Also handle data attributes and any other references
-        html_content = re.sub(
-            r'(src|href|data-[^=]+)=["\']([^"\']+\.(pck|wasm|js))["\']',
-            lambda m: f'{m.group(1)}="{asset_base_url}/{m.group(2)}"',
-            html_content
-        )
-        
-        # Also fix any JavaScript code that references these files
-        # Godot's engine.js might have hardcoded paths
-        html_content = re.sub(
-            r'["\']([^"\']+\.(pck|wasm))["\']',
-            lambda m: f'"{asset_base_url}/{m.group(1)}"',
-            html_content
-        )
-        
-        logger.info(f"🔧 Modified HTML: Added base tag, disabled ServiceWorker, fixed asset paths")
         
         # Serve with headers that allow inline styles/scripts and iframe embedding
         # Note: Removed X-Frame-Options to allow cross-origin embedding (frontend on 8080, backend on 8000)
         # Using CSP frame-ancestors instead for better control
-        return Response(
-            content=html_content.encode('utf-8'),
-            media_type="text/html",
+        # Use HTMLResponse to ensure proper HTML rendering
+        return HTMLResponse(
+            content=html_content,
             headers={
                 "Content-Security-Policy": "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: *; script-src 'self' 'unsafe-inline' 'unsafe-eval' *; style-src 'self' 'unsafe-inline' *; img-src 'self' data: blob: *; font-src 'self' data: *; connect-src 'self' *; worker-src 'self' blob: *; frame-ancestors *;",
                 "X-Content-Type-Options": "nosniff",
-                "Access-Control-Allow-Origin": "*"  # Allow CORS for asset loading
+                "Access-Control-Allow-Origin": "*",  # Allow CORS for asset loading
+                # Note: X-Frame-Options is omitted to allow iframe embedding (CSP frame-ancestors handles this)
             }
         )
     except Exception as e:
@@ -528,35 +421,26 @@ async def proxy_game_preview(
 async def download_game(
     project_id: str,
     request: Request,
-    platform: Optional[str] = Query(None, description="Platform: windows, macos, linux, android, ios, web"),
+    platform: Optional[str] = Query("windows", description="Platform: windows (prototype mode - only Windows builds)"),
     current_user = Depends(get_current_user),
     components = Depends(get_components)
 ):
     """
     Download game build for a project.
-    Auto-detects best platform based on user's system if not specified.
+    PROTOTYPE MODE: Only Windows builds are available.
+    Defaults to 'windows' if not specified.
     """
     try:
-        # Auto-detect platform from User-Agent if not specified
-        if not platform:
-            user_agent = request.headers.get("user-agent", "").lower()
-            if "windows" in user_agent:
-                platform = "windows"
-            elif "mac" in user_agent or "darwin" in user_agent:
-                platform = "macos"
-            elif "linux" in user_agent or "x11" in user_agent:
-                platform = "linux"
-            elif "android" in user_agent:
-                platform = "android"
-            elif "iphone" in user_agent or "ipad" in user_agent or "ios" in user_agent:
-                platform = "ios"
-            else:
-                platform = "web"  # Default to web for unknown platforms
+        # PROTOTYPE: Force Windows platform
+        if not platform or platform.lower() != "windows":
+            logger.info(f"📥 PROTOTYPE MODE: Requested platform '{platform}' not available, using Windows")
+            platform = "windows"
         
-        auto_detected = platform is None
-        logger.info(f"📥 Download request: project_id={project_id}, platform={platform} (auto-detected: {auto_detected})")
-        db = components['database']
-        storage_service = components['storage']
+        logger.info(f"📥 Download request: project_id={project_id}, platform={platform} (PROTOTYPE: Windows only)")
+        
+        # Safely get components with validation
+        db = get_component(components, 'db')
+        storage_service = get_component(components, 'storage')
         
         # Get builds for this project
         try:
@@ -572,44 +456,30 @@ async def download_game(
             logger.warning(f"⚠️  No builds found for project {project_id}")
             raise HTTPException(status_code=404, detail="No builds found for this project. The game may still be generating.")
         
-        # Find the requested platform build, or auto-detect best option
+        # PROTOTYPE: Only look for Windows build
         build_url = None
         filename = None
-        selected_platform = None
+        selected_platform = "windows"
         
-        # Priority order for auto-selection (if requested platform not found)
-        # Order: native desktop > mobile > web
-        platform_priority = ['windows', 'macos', 'linux', 'android', 'ios', 'web']
-        
-        if platform and platform.lower() in platform_priority:
-            # Look for specific platform
-            for build in builds:
-                build_platform = build.get('platform', '').lower()
-                logger.info(f"🔍 Checking build platform: {build_platform} (requested: {platform.lower()})")
-                if build_platform == platform.lower():
-                    build_url = build.get('build_url')
-                    selected_platform = platform.lower()
-                    filename = f"{project_id}_{platform}.{_get_file_extension(platform)}"
-                    logger.info(f"✅ Found {platform} build: {build_url}")
-                    break
-        
-        # If not found, try priority order
-        if not build_url:
-            logger.info("🔍 Platform not found, trying priority order...")
-            for p in platform_priority:
-                for build in builds:
-                    if build.get('platform', '').lower() == p:
-                        build_url = build.get('build_url')
-                        selected_platform = p
-                        filename = f"{project_id}_{p}.{_get_file_extension(p)}"
-                        logger.info(f"✅ Found {p} build: {build_url}")
-                        break
-                if build_url:
-                    break
+        # Look for Windows build
+        for build in builds:
+            build_platform = build.get('platform', '').lower()
+            logger.info(f"🔍 Checking build platform: {build_platform}")
+            if build_platform == "windows":
+                build_url = build.get('build_url')
+                filename = f"{project_id}_windows.exe"
+                logger.info(f"✅ Found Windows build: {build_url}")
+                break
         
         if not build_url:
-            logger.error(f"❌ No suitable build found. Available builds: {[(b.get('platform'), b.get('build_url')) for b in builds]}")
-            raise HTTPException(status_code=404, detail="No suitable build found for the requested platform")
+            available_platforms = [b.get('platform', 'unknown') for b in builds]
+            logger.error(f"❌ Windows build not found. Available builds: {available_platforms}")
+            error_detail = (
+                f"Windows build not found for this project. "
+                f"Available platforms: {', '.join(available_platforms) if available_platforms else 'none'}. "
+                f"The game may still be generating. Please wait and try again."
+            )
+            raise HTTPException(status_code=404, detail=error_detail)
         
         logger.info(f"📥 Using build URL: {build_url}")
         
@@ -618,163 +488,100 @@ async def download_game(
         storage_path = _extract_storage_path(build_url)
         
         file_data = None
+        download_method = None
         
+        # Method 1: Try downloading from storage using path (most reliable)
         if storage_path:
             logger.info(f"📁 Storage path extracted: {storage_path}")
-            # Try downloading from storage using path
             try:
                 file_data = await storage_service.download_file(storage_path)
-                logger.info(f"✅ Downloaded build from storage: {storage_path} ({len(file_data)} bytes)")
+                if file_data and len(file_data) > 0:
+                    download_method = "storage_path"
+                    logger.info(f"✅ Downloaded build from storage path: {storage_path} ({len(file_data)} bytes)")
+                else:
+                    logger.warning(f"⚠️  Storage path download returned empty data")
+                    file_data = None
             except Exception as download_error:
                 logger.warning(f"⚠️  Failed to download from storage path: {download_error}")
-                # Fall through to try direct URL download
                 file_data = None
         
-        # Fallback: Try downloading directly from URL if path extraction failed or storage download failed
+        # Method 2: Try downloading directly from URL (fallback)
         if not file_data:
             logger.info(f"🔄 Attempting direct download from URL: {build_url}")
             try:
                 import httpx
-                async with httpx.AsyncClient(timeout=60.0) as client:
+                async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
                     response = await client.get(build_url)
                     if response.status_code == 200:
                         file_data = response.content
-                        logger.info(f"✅ Downloaded build directly from URL ({len(file_data)} bytes)")
+                        if file_data and len(file_data) > 0:
+                            download_method = "direct_url"
+                            logger.info(f"✅ Downloaded build directly from URL ({len(file_data)} bytes)")
+                        else:
+                            logger.error(f"❌ Direct URL download returned empty data")
+                            file_data = None
                     else:
-                        logger.error(f"❌ Direct URL download failed: {response.status_code}")
-                        raise HTTPException(
-                            status_code=404,
-                            detail=f"Build file not accessible. URL returned status {response.status_code}"
-                        )
+                        logger.error(f"❌ Direct URL download failed: HTTP {response.status_code}")
+                        file_data = None
+            except httpx.TimeoutException:
+                logger.error(f"❌ Download timeout after 120 seconds")
+                raise HTTPException(
+                    status_code=504,
+                    detail="Download timeout. The file may be too large or the server is slow. Please try again."
+                )
             except httpx.RequestError as e:
                 logger.error(f"❌ HTTP request failed: {e}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to download build file: {str(e)}"
-                )
+                file_data = None
             except Exception as e:
                 logger.error(f"❌ Direct download failed: {e}", exc_info=True)
-                if not storage_path:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Invalid build URL format and direct download failed: {build_url}. Error: {str(e)}"
-                    )
-                else:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Build file not found. Storage path: {storage_path}, URL: {build_url}. Error: {str(e)}"
-                    )
+                file_data = None
         
-        if not file_data or len(file_data) == 0:
-            logger.error(f"❌ Downloaded file is empty: {storage_path}")
-            raise HTTPException(status_code=404, detail="Build file is empty")
-        
-        # For web builds, create a ZIP with all files + launcher
-        if selected_platform == 'web':
-            logger.info("📦 Creating ZIP package for web build with launcher...")
+        # Method 3: Try reading from local project directory (last resort for prototype)
+        if not file_data:
+            logger.info(f"🔄 Attempting to read from local project directory...")
             try:
-                import zipfile
-                import io
+                from pathlib import Path
+                projects_dir = Path("./core/projects")
+                local_build_path = projects_dir / project_id / "exports" / f"{project_id}_windows.exe"
                 
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                    # Add the HTML file
-                    zip_file.writestr('index.html', file_data)
-                    
-                    # Download and add all associated web files (.wasm, .pck, .js, .png)
-                    preview_prefix = f"games/{project_id}/preview/"
-                    try:
-                        # List all files in preview directory
-                        preview_files = await storage_service.list_files(preview_prefix)
-                        
-                        for file_info in preview_files:
-                            if isinstance(file_info, dict):
-                                file_name = file_info.get('name', '')
-                                if file_name and file_name != 'index.html' and file_name != 'PLAY_GAME.bat':
-                                    file_path = f"{preview_prefix}{file_name}"
-                                    try:
-                                        file_content = await storage_service.download_file(file_path)
-                                        zip_file.writestr(file_name, file_content)
-                                        logger.info(f"✅ Added to ZIP: {file_name}")
-                                    except Exception as e:
-                                        logger.warning(f"⚠️  Failed to add {file_name} to ZIP: {e}")
-                    except Exception as e:
-                        logger.warning(f"⚠️  Could not list preview files: {e}")
-                    
-                    # Add launcher script
-                    launcher_script = '''@echo off
-echo ========================================
-echo    Gamora AI - Game Launcher
-echo ========================================
-echo.
-echo Starting local server...
-echo.
-
-REM Check if Python is available
-python --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo ERROR: Python is not installed or not in PATH
-    echo.
-    echo Please install Python from https://www.python.org/
-    echo Or use one of these alternatives:
-    echo   1. Install Python and add it to PATH
-    echo   2. Use Node.js: npm install -g http-server, then run: http-server -p 8000
-    echo   3. Use VS Code Live Server extension
-    echo.
-    pause
-    exit /b 1
-)
-
-REM Start Python HTTP server in background
-start /B python -m http.server 8000
-
-REM Wait a moment for server to start
-timeout /t 2 /nobreak >nul
-
-REM Open browser
-start http://localhost:8000/index.html
-
-echo.
-echo Game should open in your browser!
-echo.
-echo To stop the server, close this window or press Ctrl+C
-echo.
-pause
-'''
-                    zip_file.writestr('PLAY_GAME.bat', launcher_script.encode('utf-8'))
-                    
-                    # Add README
-                    readme = f'''# How to Play Your Game
-
-## Quick Start (Windows)
-1. Double-click **PLAY_GAME.bat**
-2. The game will open in your browser automatically!
-
-## Manual Method
-1. Open PowerShell/Command Prompt in this folder
-2. Run: `python -m http.server 8000`
-3. Open browser: http://localhost:8000
-
-## Requirements
-- Python 3.x (for the launcher)
-- OR use Node.js: `npm install -g http-server` then `http-server -p 8000`
-- OR use VS Code Live Server extension
-
-Enjoy your game!
-'''
-                    zip_file.writestr('README.txt', readme.encode('utf-8'))
-                
-                file_data = zip_buffer.getvalue()
-                filename = f"{project_id}_web.zip"
-                content_type = 'application/zip'
-                logger.info(f"✅ Created ZIP package ({len(file_data)} bytes)")
+                if local_build_path.exists():
+                    with open(local_build_path, 'rb') as f:
+                        file_data = f.read()
+                    if file_data and len(file_data) > 0:
+                        download_method = "local_file"
+                        logger.info(f"✅ Read build from local file: {local_build_path} ({len(file_data)} bytes)")
+                    else:
+                        logger.error(f"❌ Local file is empty")
+                        file_data = None
+                else:
+                    logger.warning(f"⚠️  Local build file not found: {local_build_path}")
             except Exception as e:
-                logger.error(f"❌ Failed to create ZIP: {e}", exc_info=True)
-                # Fall back to single HTML file
-                content_type = _get_content_type('web')
-        else:
-            # Determine content type for other platforms
-            content_type = _get_content_type(selected_platform or platform or 'windows')
+                logger.error(f"❌ Failed to read local file: {e}")
+                file_data = None
+        
+        # CRITICAL: If all methods failed, return detailed error
+        if not file_data or len(file_data) == 0:
+            error_details = {
+                "storage_path": storage_path,
+                "build_url": build_url,
+                "download_method": download_method,
+                "available_builds": [b.get('platform') for b in builds]
+            }
+            logger.error(f"❌ CRITICAL: All download methods failed! Details: {error_details}")
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Failed to download Windows build. "
+                    f"Storage path: {storage_path or 'N/A'}, "
+                    f"URL: {build_url or 'N/A'}. "
+                    f"The build may not be ready yet. Please wait and try again."
+                )
+            )
+        
+        # PROTOTYPE: Windows EXE only - set proper content type
+        content_type = 'application/x-msdownload'  # Windows EXE MIME type
+        if not filename:
+            filename = f"{project_id}_windows.exe"
         
         # Return file as download
         logger.info(f"✅ Returning file download: {filename} ({len(file_data)} bytes, type: {content_type})")
@@ -784,6 +591,89 @@ Enjoy your game!
             headers={
                 "Content-Disposition": f'attachment; filename="{filename}"',
                 "Content-Length": str(len(file_data)),
+                "Access-Control-Allow-Origin": "*"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Download error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
+
+
+@generation_router.get("/download-web/{project_id}")
+async def download_web_game(
+    project_id: str,
+    current_user = Depends(get_current_user),
+    components = Depends(get_components)
+):
+    """
+    Download HTML5 web game as ZIP file for local use
+    """
+    try:
+        logger.info(f"📥 Download request for HTML5 game: project_id={project_id}")
+        
+        storage_service = components['storage']
+        
+        # Create ZIP file in memory
+        zip_buffer = io.BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # Download and add index.html
+            try:
+                index_path = f"web_games/{project_id}/index.html"
+                index_content = await storage_service.download_file(index_path)
+                zipf.writestr("index.html", index_content)
+                logger.info(f"✅ Added index.html to ZIP")
+            except Exception as e:
+                logger.error(f"❌ Failed to download index.html: {e}")
+                raise HTTPException(status_code=404, detail="Game files not found. The game may still be generating.")
+            
+            # Download and add all assets
+            try:
+                # List all files in web_games/{project_id}/ directory
+                assets_path = f"web_games/{project_id}/assets"
+                
+                # Try to download common asset files
+                asset_types = ['player', 'enemy', 'collectible', 'platform', 'background']
+                for asset_type in asset_types:
+                    try:
+                        asset_path = f"{assets_path}/{asset_type}.png"
+                        asset_content = await storage_service.download_file(asset_path)
+                        zipf.writestr(f"assets/{asset_type}.png", asset_content)
+                        logger.info(f"✅ Added {asset_type}.png to ZIP")
+                    except Exception as e:
+                        logger.debug(f"Asset {asset_type}.png not found, skipping: {e}")
+                
+                # Try to download manifest.json
+                try:
+                    manifest_path = f"{assets_path}/manifest.json"
+                    manifest_content = await storage_service.download_file(manifest_path)
+                    zipf.writestr("assets/manifest.json", manifest_content)
+                    logger.info(f"✅ Added manifest.json to ZIP")
+                except Exception as e:
+                    logger.debug(f"manifest.json not found, skipping: {e}")
+                    
+            except Exception as e:
+                logger.warning(f"⚠️  Some assets may be missing: {e}")
+                # Continue anyway - at least index.html is included
+        
+        zip_buffer.seek(0)
+        zip_data = zip_buffer.read()
+        
+        if not zip_data or len(zip_data) == 0:
+            raise HTTPException(status_code=500, detail="Failed to create ZIP file")
+        
+        filename = f"game_{project_id}.zip"
+        logger.info(f"✅ Created ZIP file: {filename} ({len(zip_data)} bytes)")
+        
+        return Response(
+            content=zip_data,
+            media_type='application/zip',
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(len(zip_data)),
                 "Access-Control-Allow-Origin": "*"
             }
         )
@@ -848,3 +738,58 @@ def _extract_storage_path(url: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"Failed to extract storage path from URL: {e}")
         return None
+
+
+# ============= CLEANUP ROUTES =============
+
+@projects_router.post("/cleanup")
+async def cleanup_projects(
+    dry_run: bool = Query(False, description="If true, only show what would be deleted"),
+    current_user = Depends(get_current_user),
+    components = Depends(get_components)
+):
+    """Clean up old projects to save disk space"""
+    cleanup_service = get_component(components, 'cleanup', required=False)
+    
+    if not cleanup_service:
+        raise HTTPException(
+            status_code=503,
+            detail="Cleanup service not available"
+        )
+    
+    try:
+        stats = await cleanup_service.cleanup_old_projects(dry_run=dry_run)
+        return {
+            "success": True,
+            "dry_run": dry_run,
+            "stats": stats,
+            "message": f"Cleanup {'simulation' if dry_run else 'completed'}: {stats['deleted']} projects deleted, {stats['space_freed_mb']:.2f} MB freed"
+        }
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
+
+
+@projects_router.get("/cleanup/stats")
+async def get_cleanup_stats(
+    current_user = Depends(get_current_user),
+    components = Depends(get_components)
+):
+    """Get statistics about projects that could be cleaned up"""
+    cleanup_service = get_component(components, 'cleanup', required=False)
+    
+    if not cleanup_service:
+        raise HTTPException(
+            status_code=503,
+            detail="Cleanup service not available"
+        )
+    
+    try:
+        stats = await cleanup_service.get_cleanup_stats()
+        return {
+            "success": True,
+            "stats": stats
+        }
+    except Exception as e:
+        logger.error(f"Cleanup stats error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to get cleanup stats: {str(e)}")
